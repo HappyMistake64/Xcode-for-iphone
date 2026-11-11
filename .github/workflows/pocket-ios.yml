@@ -1,0 +1,138 @@
+name: Pocket iOS build
+run-name: Pocket iOS ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA containing the project snapshot
+        required: true
+        type: string
+
+      request_id:
+        description: UUID identifying this build request
+        required: true
+        type: string
+      project_path:
+        description: pocket-builds/<request UUID>.json
+        required: true
+        type: string
+      app_name:
+        description: Application display name
+        required: true
+        default: PocketApp
+        type: string
+      bundle_id:
+        description: Application bundle identifier
+        required: true
+        default: cz.davidvolf.pocketapp
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pocket-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Compile unsigned iOS app
+    runs-on: macos-26
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate source commit
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          PROJECT_PATH: ${{ inputs.project_path }}
+        run: |
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo 'source_sha must be a complete commit SHA.' >&2
+            exit 1
+          fi
+          if [[ ! "$REQUEST_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo 'request_id must be a UUID.' >&2
+            exit 1
+          fi
+          if [[ "$PROJECT_PATH" != "pocket-builds/$REQUEST_ID.json" ]]; then
+            echo 'project_path must match the build request UUID.' >&2
+            exit 1
+          fi
+
+      - name: Check out exact project version
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      - name: Record toolchain
+        run: |
+          mkdir -p artifacts
+          xcodebuild -version | tee artifacts/toolchain.log
+          xcrun --sdk iphoneos --show-sdk-version | tee -a artifacts/toolchain.log
+
+      - name: Generate native Xcode project
+        env:
+          PROJECT_PATH: ${{ inputs.project_path }}
+          APP_NAME: ${{ inputs.app_name }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -o pipefail
+          python3 native-build/generate_project.py --input "$PROJECT_PATH" --output build-project --app-name "$APP_NAME" --bundle-id "$BUNDLE_ID" 2>&1 | tee artifacts/generate.log
+
+      - name: Compile for iPhone
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project build-project/PocketApp.xcodeproj \
+            -scheme PocketApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee artifacts/xcodebuild.log
+
+      - name: Package unsigned application
+        run: |
+          test -d build/Build/Products/Release-iphoneos/PocketApp.app
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/Build/Products/Release-iphoneos/PocketApp.app \
+            artifacts/PocketApp-unsigned.app.zip
+          cat > artifacts/README.txt <<'NOTE'
+          This is an unsigned native iOS .app build, not an installable IPA.
+          Installing on an iPhone requires Apple signing and a valid provisioning profile.
+          Build logs and the Xcode/SDK version are included separately.
+          NOTE
+
+      - name: Save unsigned app
+        uses: actions/upload-artifact@v7
+        with:
+          name: pocket-ios-app-${{ inputs.request_id }}
+          path: |
+            artifacts/PocketApp-unsigned.app.zip
+            artifacts/README.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save available build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pocket-ios-logs-${{ inputs.request_id }}
+          path: artifacts/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summarize result
+        if: always()
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BUILD_RESULT: ${{ job.status }}
+        run: |
+          printf '### Pocket iOS build\n\nCommit: `%s`\n\nJob result: **%s**\n\n' "$SOURCE_SHA" "$BUILD_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          printf 'A successful build produces an **unsigned iOS .app**, not an installable IPA. Apple signing and provisioning are still required for installation.\n' >> "$GITHUB_STEP_SUMMARY"
