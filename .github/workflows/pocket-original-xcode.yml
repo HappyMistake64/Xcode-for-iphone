@@ -1,0 +1,67 @@
+name: Pocket Original Xcode
+run-name: Original Xcode ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA containing the request and ZIP
+        required: true
+        type: string
+      request_id:
+        description: Canonical request UUID
+        required: true
+        type: string
+      allow_project_code:
+        description: I approve executing this project's arbitrary build scripts on the runner
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  build:
+    if: ${{ inputs.allow_project_code == true }}
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - name: Validate input identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          python3 - <<'PY'
+          import os, re, uuid
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['SOURCE_SHA'])
+          assert str(uuid.UUID(os.environ['REQUEST_ID'])) == os.environ['REQUEST_ID']
+          PY
+      - name: Checkout trusted workflow helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Checkout exact source snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: snapshot
+          persist-credentials: false
+      - name: Validate, extract and build approved original project
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          set -o pipefail
+          test "$(git -C snapshot rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p artifacts
+          python3 trusted/native-build/original-xcode/build_original.py \
+            --snapshot "$PWD/snapshot" --request-id "$REQUEST_ID" \
+            --source-sha "$SOURCE_SHA" --output "$PWD/prepared" \
+            --allow-project-code --build 2>&1 | tee artifacts/build.log
+      - name: Upload unsigned outputs and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-xcode-${{ inputs.request_id }}
+          path: artifacts/
+          if-no-files-found: ignore
