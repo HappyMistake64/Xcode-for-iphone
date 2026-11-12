@@ -40,7 +40,7 @@ export function validateProject(p) {
 
 export function validateSettings(s) {
   const repo = s.repo || REPOSITORY, appName = (s.appName || "PocketApp").trim(), bundleId = s.bundleId || "cz.davidvolf.pocketapp";
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw Error("Repozitář musí být owner/repo.");
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9_.-]+$/.test(repo)) throw Error("Repozitář musí být owner/repo.");
   if (!/^[A-Za-z][A-Za-z0-9 ._-]{0,59}$/.test(appName)) throw Error("Neplatný název aplikace.");
   if (!/^[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*){2,}$/.test(bundleId)) throw Error("Neplatné Bundle ID.");
   return {repo,appName,bundleId};
