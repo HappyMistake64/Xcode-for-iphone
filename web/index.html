@@ -34,9 +34,10 @@
       <div class="panel-heading"><div><small>01 / CONNECTION</small><h2>Propojení GitHubu</h2></div><span id="connection" class="connection-badge" aria-live="polite">● Nepřipojeno</span></div>
       <div class="form-grid">
         <label>Repozitář <input id="repo" autocomplete="off" spellcheck="false" value="HappyMistake64/Xcode-for-iphone"></label>
-        <label>GitHub token <input id="connect-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…"></label>
+        <label>GitHub token <input id="connect-token" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="go" placeholder="github_pat_…" aria-describedby="connection-status"></label>
       </div>
-      <div class="inline-actions"><button type="button" id="check-access">Připojit</button><p class="small muted">Token se neukládá do souborů ani localStorage. Potřebuje <b>Contents: Read/Write</b> a <b>Actions: Read/Write</b>.</p></div>
+      <div class="inline-actions"><button type="button" id="check-access">Ověřit a připojit</button><button type="button" id="toggle-token" class="secondary" aria-pressed="false">Zobrazit token</button><p class="small muted">Token se neukládá do souborů ani localStorage. Potřebuje <b>Contents: Read/Write</b> a <b>Actions: Read/Write</b>.</p></div>
+      <div id="connection-status" class="status connection-status" role="status" aria-live="polite" aria-atomic="true">Vlož GitHub token a klepni na Ověřit a připojit.</div>
     </section>
     <section class="panel workspace">
       <div class="panel-heading"><div><small>02 / WORKSPACE</small><h2>Swift editor</h2></div><span class="hint">Lokální autosave</span></div>

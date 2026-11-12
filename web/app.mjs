@@ -90,20 +90,51 @@ function renderBuilds() {
     wrapper.append(box);
   }
 }
+function connectionNote(message, type="info") {
+  const area=byId("connection-status");
+  area.textContent=message;
+  area.dataset.type=type;
+}
+function connectionError(err) {
+  const message=errorMessage(err);
+  if (/GitHub HTTP 401|Bad credentials/i.test(message)) return "Token GitHub odmítl (401). Zkontroluj, zda je kompletní a nebyl zneplatněn. Token sem do chatu neposílej.";
+  if (/GitHub HTTP 403/i.test(message)) return "GitHub odmítl přístup (403). Zkontroluj oprávnění tokenu k repozitáři: Contents Read/Write a Actions Read/Write.";
+  if (/GitHub HTTP 404/i.test(message)) return "Repozitář není dostupný pro tento token (404). Zkontroluj výběr repozitáře a jeho oprávnění.";
+  if (/Failed to fetch|Load failed|NetworkError|network request failed/i.test(message)) return "Safari se nepřipojilo k GitHub API. Zkontroluj připojení a případně blokování obsahu; pak to zkus znovu.";
+  return message;
+}
 async function connect() {
+  const button=byId("check-access");
+  if (button.disabled) return;
+  button.disabled=true;
+  button.textContent="Ověřuji token…";
+  connectionNote("Ověřuji přístup k repozitáři na GitHubu…");
   try {
     syncSettings();
-    const token=byId("connect-token").value;
+    const token=byId("connect-token").value.trim();
+    if (!token) throw Error("Vlož GitHub token do pole nad tímto tlačítkem.");
     const candidate=new GithubAPI(token,state.settings.repo);
-    const repo=await candidate.check();
-    if (repo.full_name!==state.settings.repo) throw Error("GitHub vrátil jiný repozitář.");
+    const repo=await candidate.verifyAccess();
     api=candidate;
     byId("connect-token").value="";
-    byId("connection").textContent="● Připojeno: "+state.settings.repo;
+    byId("connect-token").type="password";
+    byId("toggle-token").textContent="Zobrazit token";
+    byId("toggle-token").setAttribute("aria-pressed","false");
+    byId("connection").textContent="● Připojeno: "+repo.full_name;
     byId("connection").dataset.connected="true";
-    note("Připojeno. Token zůstává pouze v paměti otevřené stránky.","success");
+    connectionNote("✅ GitHub připojen. Přístup k repozitáři potvrzen, token zůstává jen v paměti stránky.","success");
+    note("GitHub připojen; můžeš sestavit aplikaci.","success");
     await refreshAll();
-  } catch(err){note(errorMessage(err),"error");}
+  } catch(err) {
+    connectionNote("❌ "+connectionError(err),"error");
+    // Preserve the typed token so the user can correct it without generating another token.
+    byId("connection").textContent="● Nepřipojeno";
+    byId("connection").dataset.connected="false";
+    api=null;
+  } finally {
+    button.disabled=false;
+    button.textContent="Ověřit a připojit";
+  }
 }
 async function submit() {
   if (busy) return;
@@ -213,6 +244,17 @@ function init() {
   });
   byId("code").addEventListener("input",saveEditing);
   byId("check-access").addEventListener("click",()=>void connect());
+  byId("connect-token").addEventListener("keydown",event=>{
+    if (event.key==="Enter") {event.preventDefault();void connect();}
+  });
+  byId("toggle-token").addEventListener("click",()=>{
+    const field=byId("connect-token");
+    const visible=field.type==="password";
+    field.type=visible?"text":"password";
+    byId("toggle-token").textContent=visible?"Skrýt token":"Zobrazit token";
+    byId("toggle-token").setAttribute("aria-pressed",String(visible));
+    field.focus();
+  });
   byId("btn-build").addEventListener("click",()=>void submit());
   byId("btn-refresh").addEventListener("click",()=>void refreshAll());
   byId("btn-add").addEventListener("click",addFile);
