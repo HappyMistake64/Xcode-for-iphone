@@ -77,7 +77,13 @@ class Identity:
         return f"Pocket iOS {self.request_id}"
 
     def artifact_name(self, kind: str) -> str:
-        return f"pocket-ios-{kind}-{self.request_id}-{self.source_sha}"
+        if kind == "identity":
+            return f"pocket-ios-identity-{self.request_id}-{self.source_sha}"
+        if kind in ("app", "logs"):
+            # Retain names consumed by the current web editor; the SHA-bound
+            # identity artifact in the SAME run is required before downloads.
+            return f"pocket-ios-{kind}-{self.request_id}"
+        raise ValueError("Unsupported artifact kind")
 
 
 def state(identity: Identity, name: str, *, run: dict[str, Any] | None = None,
@@ -192,7 +198,7 @@ def resolve(api: API, identity: Identity, run_id: int | None = None) -> dict[str
                      message="Build succeeded, but matching SHA-bound identity/app artifacts are missing or expired.")
     return state(identity, "success", run=run, verified=True,
                  artifacts=artifacts["app"] + log_artifacts + identity_artifact,
-                 message="Exact request, run and source SHA verified by workflow artifact names.")
+                 message="Exact run and request verified; source SHA bound by the identity artifact.")
 
 
 def main(argv: list[str] | None = None) -> int:
