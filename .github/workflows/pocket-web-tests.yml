@@ -1,0 +1,31 @@
+name: Pocket iPhone Editor tests
+on:
+  pull_request:
+    paths:
+      - "web/**"
+      - "tests/web-core.test.mjs"
+      - ".github/workflows/pocket-web-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "tests/web-core.test.mjs"
+      - ".github/workflows/pocket-web-tests.yml"
+permissions:
+  contents: read
+jobs:
+  browser-protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check JavaScript syntax
+        run: |
+          node --check web/core.mjs
+          node --check web/app.mjs
+          node --check web/sw.js
+      - name: Run editor protocol regression tests
+        run: node --test tests/web-core.test.mjs
