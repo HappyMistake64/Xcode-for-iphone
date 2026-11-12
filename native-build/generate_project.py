@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a dependency-free Xcode project from an Xcode Pocket JSON export.
 
-The generated target is always PocketApp. This generator does not compile or sign
+The generated application target is always PocketApp; Tests/**/*.swift adds PocketAppTests. This generator does not compile or sign
 anything: run xcodebuild on macOS after it finishes. Nested .swift files and UTF-8 Resources/ files are supported.
 Schema v3 additionally supports validated base64 image Resources.
 Web files outside Resources/ may coexist but are not compiled.
@@ -22,12 +22,16 @@ import xml.etree.ElementTree as ET
 
 MAX_BYTES = 4_000_000
 TARGET = "PocketApp"
-POCKET_GENERATOR_VERSION = 4
+POCKET_GENERATOR_VERSION = 5
 RESOURCE_SUFFIXES = {".json", ".txt", ".csv", ".plist", ".xml", ".md", ".html", ".css", ".js"}
 
 
 def uid(value):
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24].upper()
+
+
+def path_key(value):
+    return unicodedata.normalize("NFC", value.upper().lower())
 
 
 def quoted(value):
@@ -154,15 +158,23 @@ def read_input(path):
     if data["version"] != 3 and "binaries" in data:
         raise ValueError("Binary resources require schema v3.")
     paths, total = set(), 0
+    portable = {}
     for name, content in list(files.items()) + list(binaries.items()):
         if (not isinstance(name, str) or not name or len(name) > 240
                 or unicodedata.normalize("NFC", name) != name
                 or re.search(r"[\\\x00-\x1f\x7f]", name)
                 or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in name.split("/"))):
             raise ValueError("Invalid relative file path.")
-        if name.casefold() in paths:
+        if path_key(name) in paths:
             raise ValueError("Duplicate paths or paths differ only by letter case.")
-        paths.add(name.casefold())
+        paths.add(path_key(name))
+        parts = name.split("/")
+        for i in range(1, len(parts) + 1):
+            component_path = "/".join(parts[:i])
+            key = path_key(component_path)
+            if key in portable and portable[key] != component_path:
+                raise ValueError(f"Case-insensitive path collision: {portable[key]} and {component_path}.")
+            portable[key] = component_path
         if name in files:
             if not isinstance(content, str):
                 raise ValueError("Text file content must be a string.")
@@ -175,18 +187,43 @@ def read_input(path):
             total += len(validate_binary(name, content))
         if total > MAX_BYTES:
             raise ValueError("Decoded project content exceeds 4 MB.")
+    dirs = data.get("dirs", [])
+    if not isinstance(dirs, list) or len(dirs) > 400:
+        raise ValueError("Invalid project directories.")
+    for directory in dirs:
+        if (not isinstance(directory, str) or not directory or len(directory) > 240
+                or unicodedata.normalize("NFC", directory) != directory
+                or re.search(r"[\\\x00-\x1f\x7f]", directory)
+                or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in directory.split("/"))):
+            raise ValueError("Invalid directory path.")
+        parts = directory.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i]); key = path_key(prefix)
+            if key in paths:
+                raise ValueError("File/directory path conflict.")
+            if key in portable and portable[key] != prefix:
+                raise ValueError("Case-insensitive directory collision.")
+            portable[key] = prefix
     for name in paths:
         parts = name.split("/")
         if any("/".join(parts[:i]) in paths for i in range(1, len(parts))):
             raise ValueError("File/folder path conflict.")
     validate_catalog(files, binaries)
     swift = {name: content for name, content in files.items() if name.endswith(".swift")}
-    if not swift:
+    if not any(not name.startswith("Tests/") for name in swift):
         raise ValueError("No .swift files found. Native compilation needs Swift source, including an @main app.")
+    basenames = {"app": {}, "tests": {}}
+    for name in sorted(swift):
+        target = "tests" if name.startswith("Tests/") else "app"
+        basename = Path(name).name.casefold()
+        if basename in basenames[target]:
+            raise ValueError(f"Duplicate Swift filename in {target} target: {basenames[target][basename]} and {name}. Rename one file; filenames must be unique within each target.")
+        basenames[target][basename] = name
     return data, swift
 
 
-def build_project(swift, bundle_id, deployment_target, resources=None, catalog=False):
+def build_project(swift, bundle_id, deployment_target, resources=None, catalog=False, tests=None):
+    tests = tests or {}
     resources = resources or {}
     ids = {key: uid(key) for key in (
         "project", "main", "sources-group", "products", "product", "target",
@@ -225,8 +262,11 @@ def build_project(swift, bundle_id, deployment_target, resources=None, catalog=F
 
     obj(ids["product"], f"isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {TARGET}.app; sourceTree = BUILT_PRODUCTS_DIR;")
     obj(ids["sources-group"], f"isa = PBXGroup; children = {array(file_ids)}; path = Sources; sourceTree = {quoted('<group>')};")
-    obj(ids["products"], f"isa = PBXGroup; children = ({ids['product']},); name = Products; sourceTree = {quoted('<group>')};")
+    product_ids = [ids["product"]] + ([uid("test-product")] if tests else [])
+    obj(ids["products"], f"isa = PBXGroup; children = {array(product_ids)}; name = Products; sourceTree = {quoted('<group>')};")
     main_children = [ids["sources-group"], ids["products"]] + ([uid("resources-folder")] if resources else []) + ([uid("asset-catalog")] if catalog else [])
+    if tests:
+        main_children.append(uid("test-group"))
     obj(ids["main"], f"isa = PBXGroup; children = {array(main_children)}; sourceTree = {quoted('<group>')};")
     for phase, isa, members in (("sources-phase", "PBXSourcesBuildPhase", build_ids), ("frameworks-phase", "PBXFrameworksBuildPhase", []), ("resources-phase", "PBXResourcesBuildPhase", resource_ids)):
         obj(ids[phase], f"isa = {isa}; buildActionMask = 2147483647; files = {array(members)}; runOnlyForDeploymentPostprocessing = 0;")
@@ -252,6 +292,8 @@ def build_project(swift, bundle_id, deployment_target, resources=None, catalog=F
         project_settings = dict(common_project)
         target_settings = dict(common_target)
         target_settings["SWIFT_OPTIMIZATION_LEVEL"] = "-Onone" if config == "Debug" else "-O"
+        if tests and config == "Debug":
+            target_settings["ENABLE_TESTABILITY"] = "YES"
         if config == "Debug":
             target_settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "DEBUG"
         obj(ids["project-" + lower], f"isa = XCBuildConfiguration; buildSettings = {settings_block(project_settings)}; name = {config};")
@@ -259,12 +301,43 @@ def build_project(swift, bundle_id, deployment_target, resources=None, catalog=F
     for owner in ("project", "target"):
         obj(ids[owner + "-configs"], f"isa = XCConfigurationList; buildConfigurations = ({ids[owner + '-debug']}, {ids[owner + '-release']},); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;")
     obj(ids["target"], f"isa = PBXNativeTarget; buildConfigurationList = {ids['target-configs']}; buildPhases = ({ids['sources-phase']}, {ids['frameworks-phase']}, {ids['resources-phase']},); buildRules = (); dependencies = (); name = {TARGET}; productName = {TARGET}; productReference = {ids['product']}; productType = {quoted('com.apple.product-type.application')};")
-    obj(ids["project"], f"isa = PBXProject; attributes = {{ LastUpgradeCheck = 1600; }}; buildConfigurationList = {ids['project-configs']}; compatibilityVersion = {quoted('Xcode 14.0')}; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = {ids['main']}; productRefGroup = {ids['products']}; projectDirPath = {quoted('')}; projectRoot = {quoted('')}; targets = ({ids['target']},);")
+    if tests:
+        test_files, test_builds = [], []
+        for name in sorted(tests):
+            fid, bid = uid("test-file:" + name), uid("test-build:" + name)
+            test_files.append(fid)
+            test_builds.append(bid)
+            obj(fid, f'isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {quoted(name[len("Tests/"):])}; sourceTree = "<group>";')
+            obj(bid, f"isa = PBXBuildFile; fileRef = {fid};")
+        obj(uid("test-group"), f'isa = PBXGroup; children = {array(test_files)}; path = Tests; sourceTree = "<group>";')
+        obj(uid("test-product"), 'isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PocketAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR;')
+        for phase, isa, members in (("test-sources", "PBXSourcesBuildPhase", test_builds), ("test-frameworks", "PBXFrameworksBuildPhase", []), ("test-resources", "PBXResourcesBuildPhase", [])):
+            obj(uid(phase), f"isa = {isa}; buildActionMask = 2147483647; files = {array(members)}; runOnlyForDeploymentPostprocessing = 0;")
+        for config in ("Debug", "Release"):
+            settings = {
+                "PRODUCT_NAME": "PocketAppTests", "PRODUCT_BUNDLE_IDENTIFIER": bundle_id + ".tests",
+                "GENERATE_INFOPLIST_FILE": "YES", "SWIFT_VERSION": "5.0", "TARGETED_DEVICE_FAMILY": "1",
+                "SUPPORTED_PLATFORMS": "iphoneos iphonesimulator", "SUPPORTS_MACCATALYST": "NO",
+                "CODE_SIGN_STYLE": "Automatic", "BUNDLE_LOADER": "$(TEST_HOST)",
+                "TEST_HOST": "$(BUILT_PRODUCTS_DIR)/PocketApp.app/PocketApp",
+                "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks @loader_path/Frameworks",
+                "SWIFT_OPTIMIZATION_LEVEL": "-Onone" if config == "Debug" else "-O",
+                "ENABLE_USER_SCRIPT_SANDBOXING": "YES",
+            }
+            if config == "Debug":
+                settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "DEBUG"
+            obj(uid("test-" + config.lower()), f"isa = XCBuildConfiguration; buildSettings = {settings_block(settings)}; name = {config};")
+        obj(uid("test-configs"), f"isa = XCConfigurationList; buildConfigurations = ({uid('test-debug')}, {uid('test-release')},); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;")
+        obj(uid("test-proxy"), f"isa = PBXContainerItemProxy; containerPortal = {ids['project']}; proxyType = 1; remoteGlobalIDString = {ids['target']}; remoteInfo = PocketApp;")
+        obj(uid("test-dependency"), f"isa = PBXTargetDependency; target = {ids['target']}; targetProxy = {uid('test-proxy')};")
+        obj(uid("test-target"), f"isa = PBXNativeTarget; buildConfigurationList = {uid('test-configs')}; buildPhases = ({uid('test-sources')}, {uid('test-frameworks')}, {uid('test-resources')},); buildRules = (); dependencies = ({uid('test-dependency')},); name = PocketAppTests; productName = PocketAppTests; productReference = {uid('test-product')}; productType = {quoted('com.apple.product-type.bundle.unit-test')};")
+    target_ids = [ids["target"]] + ([uid("test-target")] if tests else [])
+    obj(ids["project"], f"isa = PBXProject; attributes = {{ LastUpgradeCheck = 1600; }}; buildConfigurationList = {ids['project-configs']}; compatibilityVersion = {quoted('Xcode 14.0')}; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = {ids['main']}; productRefGroup = {ids['products']}; projectDirPath = {quoted('')}; projectRoot = {quoted('')}; targets = {array(target_ids)};")
     text = "// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {};\n\tobjectVersion = 56;\n\tobjects = {\n" + "\n".join(objects) + f"\n\t}};\n\trootObject = {ids['project']};\n}}\n"
     return text, ids["target"]
 
 
-def write_scheme(path, target_id):
+def write_scheme(path, target_id, has_tests=False):
     root = ET.Element("Scheme", LastUpgradeVersion="1600", version="1.3")
     action = ET.SubElement(root, "BuildAction", parallelizeBuildables="YES", buildImplicitDependencies="YES")
     entries = ET.SubElement(action, "BuildActionEntries")
@@ -274,6 +347,15 @@ def write_scheme(path, target_id):
         ET.SubElement(parent, "BuildableReference", BuildableIdentifier="primary", BlueprintIdentifier=target_id, BuildableName=TARGET + ".app", BlueprintName=TARGET, ReferencedContainer="container:" + TARGET + ".xcodeproj")
 
     reference(entry)
+    if has_tests:
+        def test_reference(parent):
+            ET.SubElement(parent, "BuildableReference", BuildableIdentifier="primary", BlueprintIdentifier=uid("test-target"), BuildableName="PocketAppTests.xctest", BlueprintName="PocketAppTests", ReferencedContainer="container:" + TARGET + ".xcodeproj")
+        test_entry = ET.SubElement(entries, "BuildActionEntry", buildForTesting="YES", buildForRunning="NO", buildForProfiling="NO", buildForArchiving="NO", buildForAnalyzing="YES")
+        test_reference(test_entry)
+        test_action = ET.SubElement(root, "TestAction", buildConfiguration="Debug", selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB", selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB", shouldUseLaunchSchemeArgsEnv="YES")
+        reference(ET.SubElement(test_action, "MacroExpansion"))
+        testables = ET.SubElement(test_action, "Testables")
+        test_reference(ET.SubElement(testables, "TestableReference", skipped="NO"))
     launch = ET.SubElement(root, "LaunchAction", buildConfiguration="Debug", selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB", selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB", launchStyle="0", useCustomWorkingDirectory="NO", ignoresPersistentStateOnLaunch="NO", debugDocumentVersioning="YES", debugServiceExtension="internal", allowLocationSimulation="YES")
     reference(ET.SubElement(launch, "BuildableProductRunnable", runnableDebuggingMode="0"))
     ET.SubElement(root, "AnalyzeAction", buildConfiguration="Debug")
@@ -284,6 +366,8 @@ def write_scheme(path, target_id):
 
 def generate(input_path, output, bundle_id, app_name, deployment_target):
     data, swift = read_input(input_path)
+    tests = {name: content for name, content in swift.items() if name.startswith("Tests/")}
+    swift = {name: content for name, content in swift.items() if name not in tests}
     resources = {name: content for name, content in data["files"].items() if name.startswith("Resources/")}
     binaries = {name: validate_binary(name, entry) for name, entry in data.get("binaries", {}).items()}
     catalog_paths = validate_catalog(data["files"], data.get("binaries", {}))
@@ -296,13 +380,17 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
         raise ValueError("Deployment target must be an iOS version from 17.0 to 29.x.")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("Output directory must be empty or absent.")
-    project, target_id = build_project(swift, bundle_id, deployment_target, raw_resources, bool(catalog_paths))
+    project, target_id = build_project(swift, bundle_id, deployment_target, raw_resources, bool(catalog_paths), tests)
     sources = output / "Sources"
     scheme_dir = output / (TARGET + ".xcodeproj") / "xcshareddata" / "xcschemes"
     sources.mkdir(parents=True, exist_ok=True)
     scheme_dir.mkdir(parents=True)
     for name, content in swift.items():
         destination = sources / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    for name, content in tests.items():
+        destination = output / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(content, encoding="utf-8")
     for name, content in resources.items():
@@ -314,7 +402,7 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
     (output / (TARGET + ".xcodeproj") / "project.pbxproj").write_text(project, encoding="utf-8")
-    write_scheme(scheme_dir / (TARGET + ".xcscheme"), target_id)
+    write_scheme(scheme_dir / (TARGET + ".xcscheme"), target_id, bool(tests))
     info = {
         "CFBundleDevelopmentRegion": "en", "CFBundleDisplayName": app_name,
         "CFBundleExecutable": "$(EXECUTABLE_NAME)", "CFBundleIdentifier": "$(PRODUCT_BUNDLE_IDENTIFIER)",
@@ -326,7 +414,7 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
     }
     with (output / "Info.plist").open("wb") as stream:
         plistlib.dump(info, stream)
-    return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "bundle_id": bundle_id, "signed": False, "generator_version": POCKET_GENERATOR_VERSION, "resource_files": len(resources) + len(binaries), "binary_resource_files": len(binaries), "asset_catalogs": int(bool(catalog_paths))}
+    return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "test_swift_files": len(tests), "bundle_id": bundle_id, "signed": False, "generator_version": POCKET_GENERATOR_VERSION, "resource_files": len(resources) + len(binaries), "binary_resource_files": len(binaries), "asset_catalogs": int(bool(catalog_paths))}
 
 
 def main():
