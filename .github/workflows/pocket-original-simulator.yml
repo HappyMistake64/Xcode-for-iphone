@@ -1,0 +1,76 @@
+name: Pocket Original Simulator
+run-name: Original Simulator ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit SHA
+        required: true
+        type: string
+      request_id:
+        description: Canonical request UUID
+        required: true
+        type: string
+      allow_project_code:
+        description: Approve arbitrary project code and simulator launch (runner may cost money)
+        required: true
+        default: false
+        type: boolean
+      runtime_id:
+        description: Optional exact available iOS runtime ID (requires device_type_id)
+        required: false
+        type: string
+      device_type_id:
+        description: Optional exact iPhone device type ID (requires runtime_id)
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  capture:
+    if: ${{ inputs.allow_project_code == true }}
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - name: Validate input identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          python3 - <<'PY'
+          import os,re,uuid
+          assert re.fullmatch('[0-9a-f]{40}',os.environ['SOURCE_SHA'])
+          assert str(uuid.UUID(os.environ['REQUEST_ID'])) == os.environ['REQUEST_ID']
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: snapshot
+          persist-credentials: false
+      - name: Build, launch and capture approved application
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          RUNTIME_ID: ${{ inputs.runtime_id }}
+          DEVICE_TYPE_ID: ${{ inputs.device_type_id }}
+        run: |
+          set -o pipefail
+          test "$(git -C snapshot rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p simulator-artifacts
+          python3 trusted/native-build/original-xcode/run_simulator.py \
+            --snapshot "$PWD/snapshot" --request-id "$REQUEST_ID" --source-sha "$SOURCE_SHA" \
+            --output "$PWD/simulator-prepared" --artifacts "$PWD/simulator-artifacts" \
+            --runtime-id "$RUNTIME_ID" --device-type-id "$DEVICE_TYPE_ID" \
+            --allow-project-code 2>&1 | tee simulator-artifacts/runner.log
+      - name: Capture artifacts (not interactive stream)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-simulator-${{ inputs.request_id }}
+          path: simulator-artifacts/
+          if-no-files-found: ignore
