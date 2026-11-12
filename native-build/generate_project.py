@@ -2,8 +2,8 @@
 """Generate a dependency-free Xcode project from an Xcode Pocket JSON export.
 
 The generated target is always PocketApp. This generator does not compile or sign
-anything: run xcodebuild on macOS after it finishes. Only flat .swift files are
-supported; web files may coexist in the export but are not compiled.
+anything: run xcodebuild on macOS after it finishes. Nested .swift files and UTF-8 Resources/ files are supported.
+Web files outside Resources/ may coexist but are not compiled.
 """
 
 import argparse
@@ -14,10 +14,13 @@ from pathlib import Path
 import plistlib
 import re
 import sys
+import unicodedata
 import xml.etree.ElementTree as ET
 
 MAX_BYTES = 4_000_000
 TARGET = "PocketApp"
+POCKET_GENERATOR_VERSION = 2
+RESOURCE_SUFFIXES = {".json", ".txt", ".csv", ".plist", ".xml", ".md", ".html", ".css", ".js"}
 
 
 def uid(value):
@@ -43,12 +46,27 @@ def read_input(path):
     files = data.get("files")
     if not isinstance(files, dict) or not 1 <= len(files) <= 200:
         raise ValueError("Project must contain 1–200 text files.")
+    if data.get("version") not in (1, 2):
+        raise ValueError("Unsupported project schema.")
+    paths = set()
     for name, content in files.items():
-        if (not isinstance(name, str) or not name.strip() or len(name) > 200
-                or name in (".", "..", "__proto__", "constructor", "prototype")
-                or re.search(r"[/\\\x00-\x1f\x7f]", name)
+        if (not isinstance(name, str) or not name or len(name) > 240
+                or unicodedata.normalize("NFC", name) != name
+                or re.search(r"[\\\x00-\x1f\x7f]", name)
+                or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in name.split("/"))
                 or not isinstance(content, str)):
-            raise ValueError("Invalid flat text filename or file content.")
+            raise ValueError("Invalid relative text file path or content.")
+        if name.casefold() in paths:
+            raise ValueError("Paths differ only by letter case.")
+        paths.add(name.casefold())
+        if name.startswith("Resources/") and Path(name).suffix.lower() not in RESOURCE_SUFFIXES:
+            raise ValueError("Resources supports UTF-8 text data only; binary/assets/localization not supported yet.")
+        if name.startswith("Resources/") and "\x00" in content:
+            raise ValueError("Binary resource content is not supported.")
+    for name in paths:
+        parts = name.split("/")
+        if any("/".join(parts[:i]) in paths for i in range(1, len(parts))):
+            raise ValueError("File/folder path conflict.")
     swift = {name: content for name, content in files.items() if name.endswith(".swift")}
     if not swift:
         raise ValueError("No .swift files found. Native compilation needs Swift source, including an @main app.")
@@ -58,7 +76,8 @@ def read_input(path):
     return data, swift
 
 
-def build_project(swift, bundle_id, deployment_target):
+def build_project(swift, bundle_id, deployment_target, resources=None):
+    resources = resources or {}
     ids = {key: uid(key) for key in (
         "project", "main", "sources-group", "products", "product", "target",
         "sources-phase", "frameworks-phase", "resources-phase", "project-configs",
@@ -71,6 +90,7 @@ def build_project(swift, bundle_id, deployment_target):
 
     file_ids = []
     build_ids = []
+    resource_ids = []
     for name in sorted(swift):
         file_id, build_id = uid("file:" + name), uid("build:" + name)
         file_ids.append(file_id)
@@ -78,14 +98,21 @@ def build_project(swift, bundle_id, deployment_target):
         obj(file_id, f"isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {quoted(name)}; sourceTree = {quoted('<group>')};")
         obj(build_id, f"isa = PBXBuildFile; fileRef = {file_id};")
 
+    if resources:
+        rid, bid = uid("resources-folder"), uid("resources-build")
+        obj(rid, f'isa = PBXFileReference; lastKnownFileType = folder; path = Resources; sourceTree = "<group>";')
+        obj(bid, f"isa = PBXBuildFile; fileRef = {rid};")
+        resource_ids.append(bid)
+
     def array(values):
         return "(" + ", ".join(values) + ("," if values else "") + ")"
 
     obj(ids["product"], f"isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {TARGET}.app; sourceTree = BUILT_PRODUCTS_DIR;")
     obj(ids["sources-group"], f"isa = PBXGroup; children = {array(file_ids)}; path = Sources; sourceTree = {quoted('<group>')};")
     obj(ids["products"], f"isa = PBXGroup; children = ({ids['product']},); name = Products; sourceTree = {quoted('<group>')};")
-    obj(ids["main"], f"isa = PBXGroup; children = ({ids['sources-group']}, {ids['products']},); sourceTree = {quoted('<group>')};")
-    for phase, isa, members in (("sources-phase", "PBXSourcesBuildPhase", build_ids), ("frameworks-phase", "PBXFrameworksBuildPhase", []), ("resources-phase", "PBXResourcesBuildPhase", [])):
+    main_children = [ids["sources-group"], ids["products"]] + ([uid("resources-folder")] if resources else [])
+    obj(ids["main"], f"isa = PBXGroup; children = {array(main_children)}; sourceTree = {quoted('<group>')};")
+    for phase, isa, members in (("sources-phase", "PBXSourcesBuildPhase", build_ids), ("frameworks-phase", "PBXFrameworksBuildPhase", []), ("resources-phase", "PBXResourcesBuildPhase", resource_ids)):
         obj(ids[phase], f"isa = {isa}; buildActionMask = 2147483647; files = {array(members)}; runOnlyForDeploymentPostprocessing = 0;")
 
     common_project = {"CLANG_ENABLE_MODULES": "YES", "SDKROOT": "iphoneos", "IPHONEOS_DEPLOYMENT_TARGET": deployment_target}
@@ -140,7 +167,8 @@ def write_scheme(path, target_id):
 
 
 def generate(input_path, output, bundle_id, app_name, deployment_target):
-    _, swift = read_input(input_path)
+    data, swift = read_input(input_path)
+    resources = {name: content for name, content in data["files"].items() if name.startswith("Resources/")}
     if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", bundle_id):
         raise ValueError("Bundle ID must use dot-separated letters, numbers or hyphens.")
     if not app_name.strip() or len(app_name) > 80 or any(ord(c) < 32 for c in app_name):
@@ -149,13 +177,19 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
         raise ValueError("Deployment target must be an iOS version from 17.0 to 29.x.")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("Output directory must be empty or absent.")
-    project, target_id = build_project(swift, bundle_id, deployment_target)
+    project, target_id = build_project(swift, bundle_id, deployment_target, resources)
     sources = output / "Sources"
     scheme_dir = output / (TARGET + ".xcodeproj") / "xcshareddata" / "xcschemes"
     sources.mkdir(parents=True, exist_ok=True)
     scheme_dir.mkdir(parents=True)
     for name, content in swift.items():
-        (sources / name).write_text(content, encoding="utf-8")
+        destination = sources / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    for name, content in resources.items():
+        destination = output / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
     (output / (TARGET + ".xcodeproj") / "project.pbxproj").write_text(project, encoding="utf-8")
     write_scheme(scheme_dir / (TARGET + ".xcscheme"), target_id)
     info = {
@@ -169,7 +203,7 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
     }
     with (output / "Info.plist").open("wb") as stream:
         plistlib.dump(info, stream)
-    return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "bundle_id": bundle_id, "signed": False}
+    return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "bundle_id": bundle_id, "signed": False, "generator_version": POCKET_GENERATOR_VERSION, "resource_files": len(resources)}
 
 
 def main():
