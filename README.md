@@ -20,14 +20,14 @@ Co je v tomto repozitáři
 |`native-build/generate_project.py`|Generátor nativního Xcode projektu ze snímku JSON|
 |`pocket-builds/`                  |Snímky projektů odeslané ke kompilaci            |
 
-Tento repozitář nyní slouží jako build backend. Zdrojové soubory nasazeného webového editoru nejsou v kořeni tohoto repozitáře; nezaměňujte dostupný web s kompletním zdrojovým kódem zde.
+Repozitář obsahuje build backend a nový samostatný mobilní editor ve složce [web/](web/README.md). Starší externí webový editor není tímto automaticky přepsán. Publikace GitHub Pages vyžaduje zapnutí Pages v nastavení repozitáře.
 
 Ověřený stav k 12. 11. 2026
 
 • Workflow Pocket iOS build používá macos-26, timeout 15 minut a xcodebuild.
 • Běh 43123517253 skončil success. Dokládá kompilaci ukázkové aplikace, nikoli instalaci celého editoru.
 • Generátor v5 podporuje schéma projektu v1–v3; v3 umí ověřené base64 obrázky a omezené image sety Assets.xcassets.
-• Výstupem workflow je PocketApp-unsigned.app.zip, nikoli podepsaná IPA.
+• Workflow generuje PocketApp-unsigned.app.zip a strukturovanou PocketApp-unsigned.ipa; oba výstupy jsou NEPODEPSANÉ. Test balení a kompilace na macOS je ověřený.
 • Artefakty a dostupné logy jsou uchovávané 7 dní.
 • Automatický podpis, instalace na fyzický iPhone a celý cyklus aktualizace zatím nejsou ověřené.
 
@@ -39,7 +39,7 @@ Architektura
 4. Runner načte tento commit a generátor vytvoří PocketApp.xcodeproj.
 5. xcodebuild sestaví Release pro generic/platform=iOS s CODE_SIGNING_ALLOWED=NO.
 6. Workflow ověří checkout SHA a zveřejní nepodepsanou aplikaci, logy a identifikační manifest v artefaktech svázaných s request UUID i přesným SHA commitu.
-7. Balení IPA, podpis a instalace jsou následující plánovaná část.
+7. Nepodepsaná IPA je připravená pro legitimní podpisovou cestu. Podpis a instalace do fyzického iPhonu zůstávají neověřené.
 
 Kompilace probíhá v cloudu, ne přímo na procesoru iPhonu. Vyžaduje připojení a dostupný macOS runner.
 
@@ -57,7 +57,7 @@ Při ručním spuštění workflow musí snímek projektu již existovat v zadan
 |`app_name`    |Zobrazovaný název aplikace                     |
 |`bundle_id`   |Například `cz.davidvolf.pocketapp`             |
 
-Nepodepsaný ZIP nelze nainstalovat do iPhonu pouhým otevřením. Samotné přejmenování na .ipa neřeší strukturu balíčku ani podpis.
+Nepodepsané .app.zip nelze instalovat do iPhonu pouhým otevřením. Workflow nyní sestaví správnou strukturu unsigned IPA, ale ani ta bez podpisu a provisioningu neprojde instalací.
 
 Formát projektu a limity
 
@@ -85,7 +85,7 @@ Známé problémy
 
 Nesprávné přiřazení stavu běhu
 
-Nově je v samostatné vývojové větvi připraven Build Manager, který ověřuje konkrétní workflow, request UUID, run ID a SHA-vázané artefakty. Specifikace: [Reliable Builds](docs/RELIABLE_BUILDS.md). Zdrojový kód webového editoru není v tomto repozitáři, takže integrace do jeho UI zůstává otevřená.
+Build Manager a nový editor ve web/ ověřují konkrétní workflow, request UUID, run ID a SHA-vázaný identitní artefakt. Specifikace: [Reliable Builds](docs/RELIABLE_BUILDS.md). Starší externí editor není aktualizovaný a iPhone Safari E2E test není dosud doložen.
 
 V editoru byla zaznamenána zpráva „GitHub vrátil jiný běh než požadovanou kompilaci“, přestože kompilace na GitHubu uspěla. Příčina ani oprava nejsou potvrzené. Je třeba ověřit mapování request ID, workflow run ID, názvu běhu a commitu. Kontrola nesmí být odstraněna způsobem, který by zobrazoval cizí artefakt jako výsledek aktuálního požadavku.
 
@@ -108,12 +108,12 @@ Neexistuje zde implementované obejití kontroly podpisu iOS. Kompletně bezplat
 Roadmapa a kritéria dokončení
 
 ☐ Zkontrolovat obsah úspěšného artefaktu, nejen stav workflow.
-☐ Opravit sledování běhu a zachování kontextu po obnovení stránky; správný požadavek musí vždy dostat správné logy a výstup.
-☐ Automaticky vytvořit nepodepsanou IPA se strukturou Payload/PocketApp.app, ověřit její obsah a nabídnout stažení do Souborů.
+◐ Nový samostatný editor uchovává identitu buildu i po obnovení stránky a má regresní testy. Živý Safari E2E průchod je nutné ještě ověřit; starší externí editor se nemění.
+☑ Vytvořit nepodepsanou IPA se strukturou Payload/PocketApp.app a ověřit její obsah na macOS. Stažení je zatím přes GitHub Actions artefakt (ZIP), nikoli přímo jediným tlačítkem do Souborů.
 ☐ Vybrat a ověřit podpisovou cestu ovladatelnou pouze z iPhonu. Případný nákup schvaluje uživatel.
 ☐ Nainstalovat a otevřít ukázkovou aplikaci na skutečném iPhonu.
 ☐ Změnit Swift kód, sestavit aktualizaci a ověřit změnu v nainstalované aplikaci.
-☐ Ověřit ukládání, import/export a navigaci na chyby kompilátoru v editoru.
+◐ Nový webový editor implementuje lokální uložení a JSON import/export; navigace na přesné řádky chyb kompilátoru ještě chybí.
 ☐ Přidat podporu binárních prostředků a asset katalogů.
 ☐ Samostatně navrhnout nativní verzi editoru; není podmínkou prvního kompletního vývojového cyklu.
 
@@ -137,4 +137,4 @@ Licence projektu zatím nebyla zvolena. Veřejná dostupnost repozitáře sama n
 
 English overview
 
-Xcode Pocket is an experimental iPhone-first development environment backed by GitHub Actions macOS builds. This repository currently contains the native project generator, build workflow and submitted project snapshots. A sample SwiftUI build has succeeded. The workflow currently exports an unsigned iOS app ZIP, not an installable signed IPA. Signing, phone-only installation and the complete edit/build/install/update cycle remain unfinished. The project is not a port of Apple Xcode.
+Xcode Pocket is an experimental iPhone-first SwiftUI editor and GitHub Actions macOS build backend. The repository now includes an independent mobile PWA editor in web/, exact build matching, and a tested unsigned .ipa alongside the .app.zip. GitHub Pages must still be enabled, the real iPhone browser flow tested, and a legitimate signing/install path provided. An unsigned IPA cannot be installed by itself. This project is not Apple Xcode.
