@@ -176,8 +176,18 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent \
             build/Build/Products/Release-iphoneos/PocketApp.app \
             artifacts/PocketApp-unsigned.app.zip
+          # A valid .ipa container requires Payload/PocketApp.app at its root.
+          # This IPA is intentionally UNSIGNED; packaging does not bypass iOS signing.
+          mkdir -p artifacts/ipa-staging/Payload
+          ditto build/Build/Products/Release-iphoneos/PocketApp.app \
+            artifacts/ipa-staging/Payload/PocketApp.app
+          (cd artifacts/ipa-staging && zip -qry ../PocketApp-unsigned.ipa Payload)
+          unzip -Z1 artifacts/PocketApp-unsigned.ipa | grep -Fx 'Payload/PocketApp.app/Info.plist'
+          test -s artifacts/PocketApp-unsigned.ipa
+          rm -rf artifacts/ipa-staging
           cat > artifacts/README.txt <<'NOTE'
-          This is an unsigned native iOS .app build, not an installable IPA.
+          The artifact includes unsigned .app.zip AND structurally valid unsigned .ipa.
+          Neither is installable until signing and provisioning are completed.
           Installing on an iPhone requires Apple signing and a valid provisioning profile.
           Build logs and the Xcode/SDK version are included separately.
           NOTE
@@ -188,6 +198,7 @@ jobs:
           name: pocket-ios-app-${{ inputs.request_id }}
           path: |
             artifacts/PocketApp-unsigned.app.zip
+            artifacts/PocketApp-unsigned.ipa
             artifacts/README.txt
             artifacts/build-identity.json
           if-no-files-found: error
@@ -220,4 +231,4 @@ jobs:
         run: |
           printf '### Pocket iOS build\n\nCommit: `%s`\n\nJob result: **%s**\n\n' "$SOURCE_SHA" "$BUILD_RESULT" >> "$GITHUB_STEP_SUMMARY"
           printf 'XCTest step outcome: **%s** (when Tests/ sources are present).\n\n' "$TEST_RESULT / $TEST_DETAIL" >> "$GITHUB_STEP_SUMMARY"
-          printf 'A successful build produces an **unsigned iOS .app**, not an installable IPA. Apple signing and provisioning are still required for installation.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'A successful build produces an unsigned .app.zip and unsigned .ipa. Apple signing and provisioning are still required for installation.\n' >> "$GITHUB_STEP_SUMMARY"
