@@ -533,8 +533,9 @@ jobs:
               cleanup_errors = []
               try:
                   created = command(['xcrun', 'simctl', 'create', 'Pocket-' + request_id, device_type, runtime]).stdout.strip()
-                  device = str(uuid.UUID(created))
-                  # UUID is parsed rather than interpolating untrusted simulator output.
+                  uuid.UUID(created)  # Validate, but preserve simctl casing for xcodebuild destination.
+                  device = created
+                  # UUID is validated; its original representation is passed as an argument.
                   command(['xcrun', 'simctl', 'boot', device])
                   command(['xcrun', 'simctl', 'bootstatus', device, '-b'], timeout=240)
                   args = ['xcodebuild', '-project', str(prepared / manifest['project_path']), '-scheme', manifest['scheme'],
