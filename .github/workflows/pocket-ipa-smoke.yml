@@ -1,0 +1,45 @@
+name: Pocket unsigned IPA smoke
+on:
+  pull_request:
+    paths:
+      - "native-build/generate_project.py"
+      - ".github/workflows/pocket-ios.yml"
+      - ".github/workflows/pocket-ipa-smoke.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  macos-package:
+    runs-on: macos-26
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate sample native project
+        run: |
+          python3 native-build/generate_project.py \
+            --input pocket-builds/bca30ccb-961e-49ea-a343-5de9770125b4.json \
+            --output build-project \
+            --app-name PocketApp \
+            --bundle-id cz.davidvolf.pocketapp
+      - name: Compile sample for physical iPhone
+        run: |
+          set -o pipefail
+          xcodebuild -project build-project/PocketApp.xcodeproj \
+            -scheme PocketApp -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build
+      - name: Create IPA with correct Payload directory
+        run: |
+          set -euo pipefail
+          test -d build/Build/Products/Release-iphoneos/PocketApp.app
+          mkdir -p stage/Payload
+          ditto build/Build/Products/Release-iphoneos/PocketApp.app stage/Payload/PocketApp.app
+          (cd stage && zip -qry ../PocketApp-unsigned.ipa Payload)
+          unzip -t PocketApp-unsigned.ipa
+          unzip -Z1 PocketApp-unsigned.ipa | grep -Fx 'Payload/PocketApp.app/Info.plist'
+          test -s PocketApp-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocket-ipa-smoke-unsigned
+          path: PocketApp-unsigned.ipa
+          retention-days: 7
