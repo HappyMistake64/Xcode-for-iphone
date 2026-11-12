@@ -135,6 +135,42 @@ test("API uses exact saved run ID and finds unambiguous run",async()=>{
   assert.equal((await api.findRun(r)).run.id,88);
   assert.equal((await api.findRun({...r,run_id:88})).run.id,88);
 });
+
+test("token verification accepts writable GitHub repository",async()=>{
+  const api=new GithubAPI("test-token",REPOSITORY,async()=>{
+    return {ok:true,status:200,json:async()=>({full_name:REPOSITORY,permissions:{push:true}})};
+  });
+  assert.equal((await api.verifyAccess()).full_name,REPOSITORY);
+});
+test("token verification rejects read-only repository access",async()=>{
+  const api=new GithubAPI("read-only",REPOSITORY,async()=>({
+    ok:true,status:200,json:async()=>({full_name:REPOSITORY,permissions:{push:false}})
+  }));
+  await assert.rejects(api.verifyAccess(),/jen přístup pro čtení/);
+});
+test("token verification reports rejected credentials",async()=>{
+  const api=new GithubAPI("bad-token",REPOSITORY,async()=>({
+    ok:false,status:401,text:async()=>"Bad credentials"
+  }));
+  await assert.rejects(api.verifyAccess(),/GitHub HTTP 401/);
+});
+test("token verification rejects repository identity mismatch",async()=>{
+  const api=new GithubAPI("test-token",REPOSITORY,async()=>({
+    ok:true,status:200,json:async()=>({full_name:"other/repo",permissions:{push:true}})
+  }));
+  await assert.rejects(api.verifyAccess(),/jiný repozitář/);
+});
+test("mobile login feedback is next to the token field",async()=>{
+  const {readFile}=await import("node:fs/promises");
+  const html=await readFile(new URL("../web/index.html",import.meta.url),"utf8");
+  const app=await readFile(new URL("../web/app.mjs",import.meta.url),"utf8");
+  assert.match(html,/id="connection-status"/);
+  assert.ok(html.indexOf('id="connection-status"')>html.indexOf('id="connect-token"'));
+  assert.ok(html.indexOf('id="connection-status"')<html.indexOf('class="panel workspace"'));
+  assert.match(app,/connectionNote\("❌ "/);
+  assert.match(app,/byId\("connect-token"\)\.addEventListener\("keydown"/);
+});
+
 test("HTTP errors do not pretend the dispatch succeeded",async()=>{
   const api=new GithubAPI("mock",REPOSITORY,async()=>({ok:false,status:403,text:async()=>"Missing Actions permission"}));
   await assert.rejects(api.dispatch(identity()),/403/);
