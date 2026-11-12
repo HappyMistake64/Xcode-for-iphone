@@ -26,6 +26,17 @@ Na https://github.com/settings/personal-access-tokens/new vytvoř fine-grained P
 
 Repozitář je veřejný! Snímky projektů commitnuté do pocket-builds/ jsou veřejně čitelné. Žádné klíče, osobní údaje ani hesla neposílej jako zdrojový kód.
 
+## Přihlášení na iPhonu
+
+V Safari vyplň token do pole **GitHub token** a klepni na **Ověřit a připojit** (nebo na klávesnici na **Go/Enter**). Stav se zobrazuje **hned pod tlačítkem**, nikoli až v sekci kompilace.
+
+- **401 / Bad credentials:** zkontroluj správnost a platnost tokenu.
+- **403 / read-only:** v nastavení fine-grained tokenu povol Contents: Read/Write a Actions: Read/Write pro repozitář HappyMistake64/Xcode-for-iphone.
+- **404:** token nemá přístup ke zvolenému repozitáři nebo je špatně uveden.
+- **Safari / network error:** zkontroluj internet, VPN či blokování obsahu a zkus znovu.
+
+Nikomu neposílej token ani jeho screenshot. Po připojení aplikace token smaže z pole; v paměti stránky zůstane jen pro aktuální relaci. Po obnovení jej bude potřeba znovu vložit. Pokud se zobrazuje stará verze aplikace, načti web v Safari znovu, případně zavři a spusť ikonu z plochy. Lokální soubory projektů se tím nemažou.
+
 ## První build z iPhonu
 
 1. Otevři HTTPS editor v Safari, vlož PAT a stiskni Připojit.
