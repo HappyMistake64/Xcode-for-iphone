@@ -1,3 +1,4 @@
+# POCKET_WORKFLOW_VERSION = 5
 name: Pocket iOS build
 run-name: Pocket iOS ${{ inputs.request_id }}
 
@@ -84,6 +85,52 @@ jobs:
           set -o pipefail
           python3 native-build/generate_project.py --input "$PROJECT_PATH" --output build-project --app-name "$APP_NAME" --bundle-id "$BUNDLE_ID" 2>&1 | tee artifacts/generate.log
 
+      - name: Run XCTest when Tests sources exist
+        id: tests
+        run: |
+          set -o pipefail
+          if [[ ! -d build-project/Tests ]]; then
+            echo 'result=not_requested' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'result=requested' >> "$GITHUB_OUTPUT"
+          xcrun simctl list devices available --json > artifacts/simulators.json
+          SIMULATOR_ID=$(python3 - <<'PYTHON'
+          import json, re
+          data = json.load(open('artifacts/simulators.json'))
+          choices = []
+          for runtime, devices in data['devices'].items():
+              match = re.fullmatch(r'com\.apple\.CoreSimulator\.SimRuntime\.iOS-(\d+)-(\d+)(?:-(\d+))?', runtime)
+              if not match:
+                  continue
+              version = tuple(int(part or 0) for part in match.groups())
+              if version < (17, 0, 0):
+                  continue
+              for device in devices:
+                  if device.get('isAvailable') is True and device.get('name', '').startswith('iPhone'):
+                      udid = device.get('udid', '')
+                      if re.fullmatch(r'[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}', udid):
+                          choices.append((version, device['name'], udid))
+          if not choices:
+              raise SystemExit('No available iPhone simulator with iOS 17+ for XCTest.')
+          print(sorted(choices, reverse=True)[0][2])
+          PYTHON
+          )
+          xcodebuild -project build-project/PocketApp.xcodeproj -scheme PocketApp \
+            -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -destination-timeout 120 \
+            -derivedDataPath build-tests -resultBundlePath artifacts/PocketTests.xcresult \
+            CODE_SIGNING_ALLOWED=NO test 2>&1 | tee artifacts/xctest.log
+          echo 'result=passed' >> "$GITHUB_OUTPUT"
+
+      - name: Save XCTest result bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pocket-ios-tests-${{ inputs.request_id }}
+          path: artifacts/PocketTests.xcresult
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Compile for iPhone
         run: |
           set -o pipefail
@@ -133,6 +180,9 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           BUILD_RESULT: ${{ job.status }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+          TEST_DETAIL: ${{ steps.tests.outputs.result }}
         run: |
           printf '### Pocket iOS build\n\nCommit: `%s`\n\nJob result: **%s**\n\n' "$SOURCE_SHA" "$BUILD_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          printf 'XCTest step outcome: **%s** (when Tests/ sources are present).\n\n' "$TEST_RESULT / $TEST_DETAIL" >> "$GITHUB_STEP_SUMMARY"
           printf 'A successful build produces an **unsigned iOS .app**, not an installable IPA. Apple signing and provisioning are still required for installation.\n' >> "$GITHUB_STEP_SUMMARY"
