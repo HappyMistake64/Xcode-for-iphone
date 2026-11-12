@@ -185,7 +185,7 @@ jobs:
       - name: Save unsigned app
         uses: actions/upload-artifact@v7
         with:
-          name: pocket-ios-app-${{ inputs.request_id }}-${{ inputs.source_sha }}
+          name: pocket-ios-app-${{ inputs.request_id }}
           path: |
             artifacts/PocketApp-unsigned.app.zip
             artifacts/README.txt
@@ -197,7 +197,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pocket-ios-logs-${{ inputs.request_id }}-${{ inputs.source_sha }}
+          name: pocket-ios-logs-${{ inputs.request_id }}
           path: artifacts/*.log
           if-no-files-found: warn
           retention-days: 7
