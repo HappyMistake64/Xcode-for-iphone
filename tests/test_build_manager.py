@@ -103,6 +103,15 @@ class BuildManagerTests(unittest.TestCase):
         self.assertEqual(result["state"], "identity_mismatch")
         self.assertFalse(result["artifacts"])
 
+    def test_legacy_app_and_logs_are_accepted_only_with_sha_identity(self):
+        legacy = [artifact(self.a, "app", 123), artifact(self.a, "logs", 124)]
+        self.assertEqual(manager.resolve(FakeAPI([run(self.a)], legacy), self.a)["state"], "artifact_missing")
+        legacy.append(artifact(self.a, "identity", 125))
+        outcome = manager.resolve(FakeAPI([run(self.a)], legacy), self.a)
+        self.assertEqual(outcome["state"], "success")
+        self.assertTrue(outcome["source_verified"])
+        self.assertEqual(outcome["artifacts"][0]["name"], f"pocket-ios-app-{UUID_A}")
+
     def test_wrong_source_sha_cannot_return_app(self):
         api = FakeAPI([run(self.a)], [artifact(self.a, "identity", 125, source=SHA_B),
                                       artifact(self.a, "app", 123, source=SHA_B)])
