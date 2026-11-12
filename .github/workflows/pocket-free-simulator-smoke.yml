@@ -1,0 +1,608 @@
+# Self-contained public sample only. No checkout, secrets, cache or artifact upload.
+name: Pocket Free Simulator Smoke
+run-name: Pocket Smoke ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Canonical UUID for this one approved sample run
+        required: true
+        type: string
+      allow_project_code:
+        description: Explicit approval to compile and launch the included public sample
+        required: true
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  smoke:
+    if: ${{ inputs.allow_project_code == true && github.event.repository.private == false }}
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - name: Validate approved public-sample request
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          python3 - <<'PYVALIDATE'
+          import os,uuid
+          value=os.environ['REQUEST_ID']
+          assert str(uuid.UUID(value)) == value
+          PYVALIDATE
+      - name: Build launch and capture included sample (no artifacts)
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          cat > generate_project.py <<'PYGENERATOR'
+          #!/usr/bin/env python3
+          """Generate a dependency-free Xcode project from an Xcode Pocket JSON export.
+          
+          The generated application target is always PocketApp; Tests/**/*.swift adds PocketAppTests. This generator does not compile or sign
+          anything: run xcodebuild on macOS after it finishes. Nested .swift files and UTF-8 Resources/ files are supported.
+          Schema v3 additionally supports validated base64 image Resources.
+          Web files outside Resources/ may coexist but are not compiled.
+          """
+          
+          import argparse
+          import base64
+          import binascii
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import re
+          import sys
+          import unicodedata
+          import xml.etree.ElementTree as ET
+          
+          MAX_BYTES = 4_000_000
+          TARGET = "PocketApp"
+          POCKET_GENERATOR_VERSION = 5
+          RESOURCE_SUFFIXES = {".json", ".txt", ".csv", ".plist", ".xml", ".md", ".html", ".css", ".js"}
+          
+          
+          def uid(value):
+              return hashlib.sha256(value.encode("utf-8")).hexdigest()[:24].upper()
+          
+          
+          def path_key(value):
+              return unicodedata.normalize("NFC", value.upper().lower())
+          
+          
+          def quoted(value):
+              # OpenStep plist strings need backslash/quote escapes, not JSON's \u form.
+              return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+          
+          
+          def settings_block(settings):
+              return "{ " + " ".join(f"{key} = {quoted(value)};" for key, value in settings.items()) + " }"
+          
+          
+          def validate_binary(name, entry):
+              if not isinstance(entry, dict) or set(entry) != {"mime", "base64"}:
+                  raise ValueError("Binary entries require exactly mime and base64.")
+              mime, encoded = entry["mime"], entry["base64"]
+              extensions = {"image/png": {".png"}, "image/jpeg": {".jpg", ".jpeg"},
+                            "image/gif": {".gif"}, "image/webp": {".webp"}}
+              if (not isinstance(mime, str) or mime not in extensions
+                      or not name.startswith("Resources/")
+                      or Path(name).suffix.lower() not in extensions[mime]):
+                  raise ValueError("Binary image MIME, suffix and Resources/ destination must agree.")
+              if not isinstance(encoded, str) or not encoded or len(encoded) > ((MAX_BYTES + 2) // 3) * 4:
+                  raise ValueError("Invalid or oversized base64 resource.")
+              try:
+                  blob = base64.b64decode(encoded, validate=True)
+              except (binascii.Error, ValueError) as exc:
+                  raise ValueError("Invalid base64 resource.") from exc
+              if base64.b64encode(blob).decode("ascii") != encoded:
+                  raise ValueError("Resource base64 must be canonical without whitespace.")
+              signature = {
+                  "image/png": len(blob) >= 24 and blob[:8] == b"\x89PNG\r\n\x1a\n" and blob[12:16] == b"IHDR",
+                  "image/jpeg": len(blob) >= 4 and blob[:3] == b"\xff\xd8\xff" and blob[-2:] == b"\xff\xd9",
+                  "image/gif": len(blob) >= 13 and blob[:6] in (b"GIF87a", b"GIF89a"),
+                  "image/webp": len(blob) >= 16 and blob[:4] == b"RIFF" and blob[8:12] == b"WEBP",
+              }
+              if not signature[mime]:
+                  raise ValueError("Image bytes do not match the declared format or header is truncated.")
+              return blob
+          
+          
+          CATALOG = "Resources/Assets.xcassets"
+          
+          
+          def validate_catalog(files, binaries):
+              """Bounded universal PNG/JPEG image sets, not arbitrary asset catalogs."""
+              all_paths = set(files) | set(binaries)
+              asset_paths = {p for p in all_paths if any(part.lower().endswith(".xcassets") for part in p.split("/"))}
+              if not asset_paths:
+                  return set()
+              if any(not p.startswith(CATALOG + "/") for p in asset_paths):
+                  raise ValueError("Only Resources/Assets.xcassets is supported.")
+          
+              def document(path):
+                  if path not in files:
+                      raise ValueError("Asset catalog Contents.json is missing: " + path)
+                  def unique(pairs):
+                      result = {}
+                      for key, value in pairs:
+                          if key in result:
+                              raise ValueError("Duplicate asset JSON key.")
+                          result[key] = value
+                      return result
+                  value = json.loads(files[path], object_pairs_hook=unique)
+                  if not isinstance(value, dict):
+                      raise ValueError("Asset Contents.json must be an object.")
+                  info = value.get("info")
+                  if (not isinstance(info, dict) or set(info) - {"version", "author"}
+                          or type(info.get("version")) is not int or info["version"] != 1
+                          or ("author" in info and not isinstance(info["author"], str))):
+                      raise ValueError("Asset Contents.json requires info.version 1.")
+                  return value
+          
+              root = CATALOG + "/Contents.json"
+              if set(document(root)) != {"info"}:
+                  raise ValueError("Unsupported catalog root metadata.")
+              accepted, sets = {root}, set()
+              for path in asset_paths - {root}:
+                  relative = path[len(CATALOG) + 1:].split("/")
+                  if (len(relative) != 2 or not relative[0].endswith(".imageset")
+                          or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,79}", relative[0][:-9])):
+                      raise ValueError("Only named universal image sets are supported; no app icons, colors or nested asset groups.")
+                  sets.add(relative[0])
+              for name in sorted(sets):
+                  folder = CATALOG + "/" + name + "/"
+                  metadata = folder + "Contents.json"
+                  value = document(metadata)
+                  if set(value) != {"info", "images"} or not isinstance(value["images"], list) or not 1 <= len(value["images"]) <= 3:
+                      raise ValueError("Image sets require 1–3 universal scaled image entries.")
+                  accepted.add(metadata)
+                  scales, used = set(), set()
+                  for entry in value["images"]:
+                      if (not isinstance(entry, dict) or set(entry) != {"idiom", "scale", "filename"}
+                              or entry["idiom"] != "universal" or entry["scale"] not in ("1x", "2x", "3x")
+                              or not isinstance(entry["filename"], str)
+                              or "/" in entry["filename"] or "\\" in entry["filename"]
+                              or entry["filename"] in ("", ".", "..")):
+                          raise ValueError("Unsupported asset image entry or unsafe image reference.")
+                      path = folder + entry["filename"]
+                      if entry["scale"] in scales or path in used:
+                          raise ValueError("Duplicate image scale or reference.")
+                      if path not in binaries or binaries[path]["mime"] not in ("image/png", "image/jpeg"):
+                          raise ValueError("Image sets must reference existing PNG/JPEG binary resources.")
+                      scales.add(entry["scale"])
+                      used.add(path)
+                      accepted.add(path)
+              if asset_paths != accepted:
+                  raise ValueError("Asset catalog contains unreferenced or unsupported files.")
+              return accepted
+          
+          
+          def read_input(path):
+              # Base64 overhead counts toward the same serialized browser/export limit.
+              if path.stat().st_size > MAX_BYTES:
+                  raise ValueError("Project JSON exceeds 4 MB encoded limit.")
+              raw = path.read_bytes()
+              data = json.loads(raw)
+              if not isinstance(data, dict) or data.get("format") != "xcode-pocket-project":
+                  raise ValueError("Expected an xcode-pocket-project JSON export.")
+              if data.get("version") not in (1, 2, 3):
+                  raise ValueError("Unsupported project schema.")
+              files, binaries = data.get("files"), data.get("binaries", {})
+              if not isinstance(files, dict) or not isinstance(binaries, dict) or not 1 <= len(files) + len(binaries) <= 200:
+                  raise ValueError("Project must contain 1–200 total files.")
+              if data["version"] != 3 and "binaries" in data:
+                  raise ValueError("Binary resources require schema v3.")
+              paths, total = set(), 0
+              portable = {}
+              for name, content in list(files.items()) + list(binaries.items()):
+                  if (not isinstance(name, str) or not name or len(name) > 240
+                          or unicodedata.normalize("NFC", name) != name
+                          or re.search(r"[\\\x00-\x1f\x7f]", name)
+                          or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in name.split("/"))):
+                      raise ValueError("Invalid relative file path.")
+                  if path_key(name) in paths:
+                      raise ValueError("Duplicate paths or paths differ only by letter case.")
+                  paths.add(path_key(name))
+                  parts = name.split("/")
+                  for i in range(1, len(parts) + 1):
+                      component_path = "/".join(parts[:i])
+                      key = path_key(component_path)
+                      if key in portable and portable[key] != component_path:
+                          raise ValueError(f"Case-insensitive path collision: {portable[key]} and {component_path}.")
+                      portable[key] = component_path
+                  if name in files:
+                      if not isinstance(content, str):
+                          raise ValueError("Text file content must be a string.")
+                      if name.startswith("Resources/") and Path(name).suffix.lower() not in RESOURCE_SUFFIXES:
+                          raise ValueError("Text Resources supports UTF-8 data; images belong in the v3 binaries map.")
+                      if name.startswith("Resources/") and "\x00" in content:
+                          raise ValueError("Binary resource content is not supported as text.")
+                      total += len(content.encode("utf-8"))
+                  else:
+                      total += len(validate_binary(name, content))
+                  if total > MAX_BYTES:
+                      raise ValueError("Decoded project content exceeds 4 MB.")
+              dirs = data.get("dirs", [])
+              if not isinstance(dirs, list) or len(dirs) > 400:
+                  raise ValueError("Invalid project directories.")
+              for directory in dirs:
+                  if (not isinstance(directory, str) or not directory or len(directory) > 240
+                          or unicodedata.normalize("NFC", directory) != directory
+                          or re.search(r"[\\\x00-\x1f\x7f]", directory)
+                          or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in directory.split("/"))):
+                      raise ValueError("Invalid directory path.")
+                  parts = directory.split("/")
+                  for i in range(1, len(parts) + 1):
+                      prefix = "/".join(parts[:i]); key = path_key(prefix)
+                      if key in paths:
+                          raise ValueError("File/directory path conflict.")
+                      if key in portable and portable[key] != prefix:
+                          raise ValueError("Case-insensitive directory collision.")
+                      portable[key] = prefix
+              for name in paths:
+                  parts = name.split("/")
+                  if any("/".join(parts[:i]) in paths for i in range(1, len(parts))):
+                      raise ValueError("File/folder path conflict.")
+              validate_catalog(files, binaries)
+              swift = {name: content for name, content in files.items() if name.endswith(".swift")}
+              if not any(not name.startswith("Tests/") for name in swift):
+                  raise ValueError("No .swift files found. Native compilation needs Swift source, including an @main app.")
+              basenames = {"app": {}, "tests": {}}
+              for name in sorted(swift):
+                  target = "tests" if name.startswith("Tests/") else "app"
+                  basename = Path(name).name.casefold()
+                  if basename in basenames[target]:
+                      raise ValueError(f"Duplicate Swift filename in {target} target: {basenames[target][basename]} and {name}. Rename one file; filenames must be unique within each target.")
+                  basenames[target][basename] = name
+              return data, swift
+          
+          
+          def build_project(swift, bundle_id, deployment_target, resources=None, catalog=False, tests=None):
+              tests = tests or {}
+              resources = resources or {}
+              ids = {key: uid(key) for key in (
+                  "project", "main", "sources-group", "products", "product", "target",
+                  "sources-phase", "frameworks-phase", "resources-phase", "project-configs",
+                  "target-configs", "project-debug", "project-release", "target-debug", "target-release",
+              )}
+              objects = []
+          
+              def obj(identifier, body):
+                  objects.append(f"\t\t{identifier} = {{ {body} }};")
+          
+              file_ids = []
+              build_ids = []
+              resource_ids = []
+              for name in sorted(swift):
+                  file_id, build_id = uid("file:" + name), uid("build:" + name)
+                  file_ids.append(file_id)
+                  build_ids.append(build_id)
+                  obj(file_id, f"isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {quoted(name)}; sourceTree = {quoted('<group>')};")
+                  obj(build_id, f"isa = PBXBuildFile; fileRef = {file_id};")
+          
+              if resources:
+                  rid, bid = uid("resources-folder"), uid("resources-build")
+                  obj(rid, f'isa = PBXFileReference; lastKnownFileType = folder; path = Resources; sourceTree = "<group>";')
+                  obj(bid, f"isa = PBXBuildFile; fileRef = {rid};")
+                  resource_ids.append(bid)
+          
+              if catalog:
+                  rid, bid = uid("asset-catalog"), uid("asset-catalog-build")
+                  obj(rid, 'isa = PBXFileReference; lastKnownFileType = wrapper.assetcatalog; path = Assets.xcassets; sourceTree = "<group>";')
+                  obj(bid, f"isa = PBXBuildFile; fileRef = {rid};")
+                  resource_ids.append(bid)
+          
+              def array(values):
+                  return "(" + ", ".join(values) + ("," if values else "") + ")"
+          
+              obj(ids["product"], f"isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {TARGET}.app; sourceTree = BUILT_PRODUCTS_DIR;")
+              obj(ids["sources-group"], f"isa = PBXGroup; children = {array(file_ids)}; path = Sources; sourceTree = {quoted('<group>')};")
+              product_ids = [ids["product"]] + ([uid("test-product")] if tests else [])
+              obj(ids["products"], f"isa = PBXGroup; children = {array(product_ids)}; name = Products; sourceTree = {quoted('<group>')};")
+              main_children = [ids["sources-group"], ids["products"]] + ([uid("resources-folder")] if resources else []) + ([uid("asset-catalog")] if catalog else [])
+              if tests:
+                  main_children.append(uid("test-group"))
+              obj(ids["main"], f"isa = PBXGroup; children = {array(main_children)}; sourceTree = {quoted('<group>')};")
+              for phase, isa, members in (("sources-phase", "PBXSourcesBuildPhase", build_ids), ("frameworks-phase", "PBXFrameworksBuildPhase", []), ("resources-phase", "PBXResourcesBuildPhase", resource_ids)):
+                  obj(ids[phase], f"isa = {isa}; buildActionMask = 2147483647; files = {array(members)}; runOnlyForDeploymentPostprocessing = 0;")
+          
+              common_project = {"CLANG_ENABLE_MODULES": "YES", "SDKROOT": "iphoneos", "IPHONEOS_DEPLOYMENT_TARGET": deployment_target}
+              common_target = {
+                  "PRODUCT_NAME": TARGET,
+                  "PRODUCT_BUNDLE_IDENTIFIER": bundle_id,
+                  "INFOPLIST_FILE": "Info.plist",
+                  "GENERATE_INFOPLIST_FILE": "NO",
+                  "SWIFT_VERSION": "5.0",
+                  "TARGETED_DEVICE_FAMILY": "1",
+                  "SUPPORTED_PLATFORMS": "iphoneos iphonesimulator",
+                  "SUPPORTS_MACCATALYST": "NO",
+                  "CODE_SIGN_STYLE": "Automatic",
+                  "CURRENT_PROJECT_VERSION": "1",
+                  "MARKETING_VERSION": "1.0",
+                  "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks",
+                  "ENABLE_USER_SCRIPT_SANDBOXING": "YES",
+              }
+              for config in ("Debug", "Release"):
+                  lower = config.lower()
+                  project_settings = dict(common_project)
+                  target_settings = dict(common_target)
+                  target_settings["SWIFT_OPTIMIZATION_LEVEL"] = "-Onone" if config == "Debug" else "-O"
+                  if tests and config == "Debug":
+                      target_settings["ENABLE_TESTABILITY"] = "YES"
+                  if config == "Debug":
+                      target_settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "DEBUG"
+                  obj(ids["project-" + lower], f"isa = XCBuildConfiguration; buildSettings = {settings_block(project_settings)}; name = {config};")
+                  obj(ids["target-" + lower], f"isa = XCBuildConfiguration; buildSettings = {settings_block(target_settings)}; name = {config};")
+              for owner in ("project", "target"):
+                  obj(ids[owner + "-configs"], f"isa = XCConfigurationList; buildConfigurations = ({ids[owner + '-debug']}, {ids[owner + '-release']},); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;")
+              obj(ids["target"], f"isa = PBXNativeTarget; buildConfigurationList = {ids['target-configs']}; buildPhases = ({ids['sources-phase']}, {ids['frameworks-phase']}, {ids['resources-phase']},); buildRules = (); dependencies = (); name = {TARGET}; productName = {TARGET}; productReference = {ids['product']}; productType = {quoted('com.apple.product-type.application')};")
+              if tests:
+                  test_files, test_builds = [], []
+                  for name in sorted(tests):
+                      fid, bid = uid("test-file:" + name), uid("test-build:" + name)
+                      test_files.append(fid)
+                      test_builds.append(bid)
+                      obj(fid, f'isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {quoted(name[len("Tests/"):])}; sourceTree = "<group>";')
+                      obj(bid, f"isa = PBXBuildFile; fileRef = {fid};")
+                  obj(uid("test-group"), f'isa = PBXGroup; children = {array(test_files)}; path = Tests; sourceTree = "<group>";')
+                  obj(uid("test-product"), 'isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PocketAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR;')
+                  for phase, isa, members in (("test-sources", "PBXSourcesBuildPhase", test_builds), ("test-frameworks", "PBXFrameworksBuildPhase", []), ("test-resources", "PBXResourcesBuildPhase", [])):
+                      obj(uid(phase), f"isa = {isa}; buildActionMask = 2147483647; files = {array(members)}; runOnlyForDeploymentPostprocessing = 0;")
+                  for config in ("Debug", "Release"):
+                      settings = {
+                          "PRODUCT_NAME": "PocketAppTests", "PRODUCT_BUNDLE_IDENTIFIER": bundle_id + ".tests",
+                          "GENERATE_INFOPLIST_FILE": "YES", "SWIFT_VERSION": "5.0", "TARGETED_DEVICE_FAMILY": "1",
+                          "SUPPORTED_PLATFORMS": "iphoneos iphonesimulator", "SUPPORTS_MACCATALYST": "NO",
+                          "CODE_SIGN_STYLE": "Automatic", "BUNDLE_LOADER": "$(TEST_HOST)",
+                          "TEST_HOST": "$(BUILT_PRODUCTS_DIR)/PocketApp.app/PocketApp",
+                          "LD_RUNPATH_SEARCH_PATHS": "$(inherited) @executable_path/Frameworks @loader_path/Frameworks",
+                          "SWIFT_OPTIMIZATION_LEVEL": "-Onone" if config == "Debug" else "-O",
+                          "ENABLE_USER_SCRIPT_SANDBOXING": "YES",
+                      }
+                      if config == "Debug":
+                          settings["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "DEBUG"
+                      obj(uid("test-" + config.lower()), f"isa = XCBuildConfiguration; buildSettings = {settings_block(settings)}; name = {config};")
+                  obj(uid("test-configs"), f"isa = XCConfigurationList; buildConfigurations = ({uid('test-debug')}, {uid('test-release')},); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;")
+                  obj(uid("test-proxy"), f"isa = PBXContainerItemProxy; containerPortal = {ids['project']}; proxyType = 1; remoteGlobalIDString = {ids['target']}; remoteInfo = PocketApp;")
+                  obj(uid("test-dependency"), f"isa = PBXTargetDependency; target = {ids['target']}; targetProxy = {uid('test-proxy')};")
+                  obj(uid("test-target"), f"isa = PBXNativeTarget; buildConfigurationList = {uid('test-configs')}; buildPhases = ({uid('test-sources')}, {uid('test-frameworks')}, {uid('test-resources')},); buildRules = (); dependencies = ({uid('test-dependency')},); name = PocketAppTests; productName = PocketAppTests; productReference = {uid('test-product')}; productType = {quoted('com.apple.product-type.bundle.unit-test')};")
+              target_ids = [ids["target"]] + ([uid("test-target")] if tests else [])
+              obj(ids["project"], f"isa = PBXProject; attributes = {{ LastUpgradeCheck = 1600; }}; buildConfigurationList = {ids['project-configs']}; compatibilityVersion = {quoted('Xcode 14.0')}; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = {ids['main']}; productRefGroup = {ids['products']}; projectDirPath = {quoted('')}; projectRoot = {quoted('')}; targets = {array(target_ids)};")
+              text = "// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {};\n\tobjectVersion = 56;\n\tobjects = {\n" + "\n".join(objects) + f"\n\t}};\n\trootObject = {ids['project']};\n}}\n"
+              return text, ids["target"]
+          
+          
+          def write_scheme(path, target_id, has_tests=False):
+              root = ET.Element("Scheme", LastUpgradeVersion="1600", version="1.3")
+              action = ET.SubElement(root, "BuildAction", parallelizeBuildables="YES", buildImplicitDependencies="YES")
+              entries = ET.SubElement(action, "BuildActionEntries")
+              entry = ET.SubElement(entries, "BuildActionEntry", buildForTesting="YES", buildForRunning="YES", buildForProfiling="YES", buildForArchiving="YES", buildForAnalyzing="YES")
+          
+              def reference(parent):
+                  ET.SubElement(parent, "BuildableReference", BuildableIdentifier="primary", BlueprintIdentifier=target_id, BuildableName=TARGET + ".app", BlueprintName=TARGET, ReferencedContainer="container:" + TARGET + ".xcodeproj")
+          
+              reference(entry)
+              if has_tests:
+                  def test_reference(parent):
+                      ET.SubElement(parent, "BuildableReference", BuildableIdentifier="primary", BlueprintIdentifier=uid("test-target"), BuildableName="PocketAppTests.xctest", BlueprintName="PocketAppTests", ReferencedContainer="container:" + TARGET + ".xcodeproj")
+                  test_entry = ET.SubElement(entries, "BuildActionEntry", buildForTesting="YES", buildForRunning="NO", buildForProfiling="NO", buildForArchiving="NO", buildForAnalyzing="YES")
+                  test_reference(test_entry)
+                  test_action = ET.SubElement(root, "TestAction", buildConfiguration="Debug", selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB", selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB", shouldUseLaunchSchemeArgsEnv="YES")
+                  reference(ET.SubElement(test_action, "MacroExpansion"))
+                  testables = ET.SubElement(test_action, "Testables")
+                  test_reference(ET.SubElement(testables, "TestableReference", skipped="NO"))
+              launch = ET.SubElement(root, "LaunchAction", buildConfiguration="Debug", selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB", selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB", launchStyle="0", useCustomWorkingDirectory="NO", ignoresPersistentStateOnLaunch="NO", debugDocumentVersioning="YES", debugServiceExtension="internal", allowLocationSimulation="YES")
+              reference(ET.SubElement(launch, "BuildableProductRunnable", runnableDebuggingMode="0"))
+              ET.SubElement(root, "AnalyzeAction", buildConfiguration="Debug")
+              ET.SubElement(root, "ArchiveAction", buildConfiguration="Release", revealArchiveInOrganizer="YES")
+              ET.indent(root)
+              ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+          
+          
+          def generate(input_path, output, bundle_id, app_name, deployment_target):
+              data, swift = read_input(input_path)
+              tests = {name: content for name, content in swift.items() if name.startswith("Tests/")}
+              swift = {name: content for name, content in swift.items() if name not in tests}
+              resources = {name: content for name, content in data["files"].items() if name.startswith("Resources/")}
+              binaries = {name: validate_binary(name, entry) for name, entry in data.get("binaries", {}).items()}
+              catalog_paths = validate_catalog(data["files"], data.get("binaries", {}))
+              raw_resources = {name: content for name, content in {**resources, **binaries}.items() if name not in catalog_paths}
+              if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", bundle_id):
+                  raise ValueError("Bundle ID must use dot-separated letters, numbers or hyphens.")
+              if not app_name.strip() or len(app_name) > 80 or any(ord(c) < 32 for c in app_name):
+                  raise ValueError("Display name must contain 1–80 printable characters.")
+              if not re.fullmatch(r"(?:1[7-9]|2[0-9])\.[0-9]{1,2}", deployment_target):
+                  raise ValueError("Deployment target must be an iOS version from 17.0 to 29.x.")
+              if output.exists() and (not output.is_dir() or any(output.iterdir())):
+                  raise ValueError("Output directory must be empty or absent.")
+              project, target_id = build_project(swift, bundle_id, deployment_target, raw_resources, bool(catalog_paths), tests)
+              sources = output / "Sources"
+              scheme_dir = output / (TARGET + ".xcodeproj") / "xcshareddata" / "xcschemes"
+              sources.mkdir(parents=True, exist_ok=True)
+              scheme_dir.mkdir(parents=True)
+              for name, content in swift.items():
+                  destination = sources / name
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_text(content, encoding="utf-8")
+              for name, content in tests.items():
+                  destination = output / name
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_text(content, encoding="utf-8")
+              for name, content in resources.items():
+                  destination = output / (name[len("Resources/"):] if name in catalog_paths else name)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_text(content, encoding="utf-8")
+              for name, content in binaries.items():
+                  destination = output / (name[len("Resources/"):] if name in catalog_paths else name)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(content)
+              (output / (TARGET + ".xcodeproj") / "project.pbxproj").write_text(project, encoding="utf-8")
+              write_scheme(scheme_dir / (TARGET + ".xcscheme"), target_id, bool(tests))
+              info = {
+                  "CFBundleDevelopmentRegion": "en", "CFBundleDisplayName": app_name,
+                  "CFBundleExecutable": "$(EXECUTABLE_NAME)", "CFBundleIdentifier": "$(PRODUCT_BUNDLE_IDENTIFIER)",
+                  "CFBundleInfoDictionaryVersion": "6.0", "CFBundleName": "$(PRODUCT_NAME)", "CFBundlePackageType": "APPL",
+                  "CFBundleShortVersionString": "$(MARKETING_VERSION)", "CFBundleVersion": "$(CURRENT_PROJECT_VERSION)",
+                  "LSRequiresIPhoneOS": True, "UILaunchScreen": {},
+                  "UIApplicationSceneManifest": {"UIApplicationSupportsMultipleScenes": False},
+                  "UISupportedInterfaceOrientations": ["UIInterfaceOrientationPortrait", "UIInterfaceOrientationLandscapeLeft", "UIInterfaceOrientationLandscapeRight"],
+              }
+              with (output / "Info.plist").open("wb") as stream:
+                  plistlib.dump(info, stream)
+              return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "test_swift_files": len(tests), "bundle_id": bundle_id, "signed": False, "generator_version": POCKET_GENERATOR_VERSION, "resource_files": len(resources) + len(binaries), "binary_resource_files": len(binaries), "asset_catalogs": int(bool(catalog_paths))}
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("--input", type=Path, required=True)
+              parser.add_argument("--output", type=Path, required=True)
+              parser.add_argument("--bundle-id", default=os.environ.get("IOS_BUNDLE_ID", "cz.davidvolf.pocketapp"))
+              parser.add_argument("--app-name", default=os.environ.get("IOS_APP_NAME", "Pocket App"))
+              parser.add_argument("--deployment-target", default=os.environ.get("IOS_DEPLOYMENT_TARGET", "17.0"))
+              args = parser.parse_args()
+              try:
+                  result = generate(args.input, args.output, args.bundle_id, args.app_name, args.deployment_target)
+              except (ValueError, OSError) as exc:
+                  print(f"Project generation failed: {exc}", file=sys.stderr)
+                  return 1
+              print(json.dumps(result))
+              return 0
+          
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYGENERATOR
+          cat > simulator.py <<'PYSIMULATOR'
+          #!/usr/bin/env python3
+          """Approved original-project simulator build/launch capture; not interactive streaming."""
+          import argparse
+          import json
+          from pathlib import Path
+          import plistlib
+          import re
+          import subprocess
+          import time
+          import uuid
+          
+          
+          def command(args, **kwargs):
+              return subprocess.run(args, check=True, text=True, capture_output=True, timeout=kwargs.pop('timeout', 120), **kwargs)
+          
+          
+          def choose(inventory, runtime_id=None, device_type_id=None):
+              if bool(runtime_id) != bool(device_type_id):
+                  raise ValueError('Select both runtime_id and device_type_id, or neither')
+              if runtime_id and (not re.fullmatch(r'com\.apple\.CoreSimulator\.SimRuntime\.iOS-[0-9-]+', runtime_id) or not re.fullmatch(r'com\.apple\.CoreSimulator\.SimDeviceType\.[A-Za-z0-9-]+', device_type_id)):
+                  raise ValueError('Invalid simulator identifier')
+              runtimes = [r for r in inventory.get('runtimes', []) if r.get('isAvailable') is True and
+                          isinstance(r.get('identifier'), str) and re.fullmatch(r'com\.apple\.CoreSimulator\.SimRuntime\.iOS-[0-9-]+', r['identifier']) and re.fullmatch(r'\d+(?:\.\d+)*', r.get('version', ''))]
+              types = [d for d in inventory.get('devicetypes', []) if d.get('productFamily') == 'iPhone' and isinstance(d.get('identifier'), str) and re.fullmatch(r'com\.apple\.CoreSimulator\.SimDeviceType\.[A-Za-z0-9-]+', d['identifier'])]
+              if runtime_id:
+                  runtimes = [r for r in runtimes if r['identifier'] == runtime_id]
+                  types = [d for d in types if d['identifier'] == device_type_id]
+              if not runtimes or not types:
+                  raise ValueError('Requested available iOS runtime/iPhone device type not found')
+              runtime = max(runtimes, key=lambda r: tuple(int(n) for n in r['version'].split('.')))
+              supported = runtime.get('supportedDeviceTypes')
+              if isinstance(supported, list):
+                  ids = {d.get('identifier') for d in supported if isinstance(d, dict)}
+                  types = [d for d in types if d['identifier'] in ids]
+              if not types:
+                  raise ValueError('Runtime does not support selected iPhone device type')
+              device = sorted(types, key=lambda d: d['identifier'])[-1]
+              return runtime['identifier'], device['identifier']
+          
+          
+          def run(prepared, manifest, artifacts, request_id, allow_project_code=False, runtime_id=None, device_type_id=None):
+              if not allow_project_code:
+                  raise ValueError('Explicit approval for project execution and simulator launch required')
+              if str(uuid.UUID(request_id)) != request_id:
+                  raise ValueError('Invalid request UUID')
+              prepared, artifacts = Path(prepared).resolve(), Path(artifacts).resolve()
+              artifacts.mkdir(parents=True, exist_ok=True)
+              derived = prepared.parent / ('simulator-derived-' + request_id)
+              if derived.exists():
+                  raise ValueError('Fresh simulator derived-data directory required')
+              inventory = json.loads(command(['xcrun', 'simctl', 'list', '--json']).stdout)
+              runtime, device_type = choose(inventory, runtime_id, device_type_id)
+              device = None
+              bundle = None
+              cleanup_errors = []
+              try:
+                  created = command(['xcrun', 'simctl', 'create', 'Pocket-' + request_id, device_type, runtime]).stdout.strip()
+                  device = str(uuid.UUID(created))
+                  # UUID is parsed rather than interpolating untrusted simulator output.
+                  command(['xcrun', 'simctl', 'boot', device])
+                  command(['xcrun', 'simctl', 'bootstatus', device, '-b'], timeout=240)
+                  args = ['xcodebuild', '-project', str(prepared / manifest['project_path']), '-scheme', manifest['scheme'],
+                          '-configuration', 'Debug', '-sdk', 'iphonesimulator', '-destination', 'id=' + device,
+                          '-derivedDataPath', str(derived), '-disableAutomaticPackageResolution', '-skipPackageUpdates',
+                          'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY=', 'build']
+                  with (artifacts / 'build.log').open('w') as log:
+                      subprocess.run(args, check=True, text=True, stdout=log, stderr=subprocess.STDOUT, timeout=900)
+                  products = derived / 'Build/Products/Debug-iphonesimulator'
+                  apps = list(products.glob('*.app'))
+                  if len(apps) != 1 or apps[0].is_symlink():
+                      raise ValueError('Expected one real simulator application')
+                  app = apps[0]
+                  if any(p.is_symlink() for p in app.rglob('*')):
+                      raise ValueError('Simulator app symlinks are not supported by this bounded runner')
+                  with (app / 'Info.plist').open('rb') as f:
+                      info = plistlib.load(f)
+                  bundle = info.get('CFBundleIdentifier')
+                  if not isinstance(bundle, str) or not re.fullmatch(r'[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+', bundle):
+                      raise ValueError('Invalid built application bundle identifier')
+                  command(['xcrun', 'simctl', 'install', device, str(app)])
+                  launch = command(['xcrun', 'simctl', 'launch', '--terminate-running-process', device, bundle])
+                  (artifacts / 'launch.log').write_text(launch.stdout + launch.stderr)
+                  # A short settling delay is not evidence of app health or full interaction coverage.
+                  time.sleep(3)
+                  command(['xcrun', 'simctl', 'io', device, 'screenshot', str(artifacts / 'screenshot.png')])
+                  (artifacts / 'run.json').write_text(json.dumps({'request_id': request_id, 'device_uuid': device,
+                      'runtime_id': runtime, 'device_type_id': device_type, 'bundle_id': bundle,
+                      'capture': 'single screenshot after launch; not interactive streaming'}, indent=2))
+              finally:
+                  if device:
+                      actions = ([['terminate', device, bundle]] if bundle else []) + [['shutdown', device], ['delete', device]]
+                      for action in actions:
+                          try:
+                              command(['xcrun', 'simctl'] + action)
+                          except Exception as error:
+                              cleanup_errors.append(type(error).__name__ + ': ' + action[0])
+                  (artifacts / 'cleanup.json').write_text(json.dumps({'device_uuid': device, 'errors': cleanup_errors}))
+          PYSIMULATOR
+          cat > smoke.py <<'PYSMOKE'
+          import base64, hashlib, json, os, pathlib, subprocess, uuid
+          import generate_project
+          import simulator
+          request_id = os.environ['REQUEST_ID']
+          assert str(uuid.UUID(request_id)) == request_id
+          work = pathlib.Path(os.environ['RUNNER_TEMP']) / ('pocket-smoke-' + request_id)
+          work.mkdir(exist_ok=False)
+          source = work / 'sample.json'
+          source.write_text('{"format": "xcode-pocket-project", "version": 1, "files": {"App.swift": "import SwiftUI\\n@main struct SmokeApp: App {\\n    var body: some Scene { WindowGroup { ContentView() } }\\n}\\nstruct ContentView: View {\\n    var body: some View {\\n        VStack(spacing: 20) {\\n            Image(systemName: \\"checkmark.circle.fill\\").font(.system(size: 72)).foregroundStyle(.purple)\\n            Text(\\"Pocket Simulator\\").font(.largeTitle.bold())\\n            Text(\\"Public sample \\u00b7 no personal source\\").foregroundStyle(.secondary)\\n            Text(\\"Build \\u2192 Launch \\u2192 Capture\\").font(.headline)\\n        }.padding().preferredColorScheme(.dark)\\n    }\\n}\\n"}}')
+          prepared = work / 'prepared'
+          generate_project.generate(source, prepared, 'org.example.pocketsmoke', 'Pocket Simulator', '17.0')
+          artifacts = work / 'capture'
+          try:
+              simulator.run(prepared, {'project_path':'PocketApp.xcodeproj','scheme':'PocketApp'}, artifacts, request_id, True)
+          finally:
+              for name in ['build.log','cleanup.json']:
+                  path=artifacts/name
+                  if path.exists(): print('POCKET_LOG '+request_id+' '+name+' '+json.dumps(path.read_text(errors='replace')[-24000:]),flush=True)
+          image = artifacts / 'screenshot.jpg'
+          subprocess.run(['sips','--resampleHeightWidthMax','900','-s','format','jpeg','-s','formatOptions','75',str(artifacts/'screenshot.png'),'--out',str(image)],check=True,timeout=60,capture_output=True)
+          data=image.read_bytes()
+          if len(data)>1024*1024: raise ValueError('Screenshot exceeds bounded log transport limit')
+          encoded=base64.b64encode(data).decode('ascii')
+          chunks=[encoded[i:i+4096] for i in range(0,len(encoded),4096)]
+          print('POCKET_SCREENSHOT_BEGIN '+request_id+' '+json.dumps({'mime':'image/jpeg','bytes':len(data),'chunks':len(chunks),'sha256':hashlib.sha256(data).hexdigest()},sort_keys=True),flush=True)
+          for index,chunk in enumerate(chunks): print('POCKET_SCREENSHOT_CHUNK '+request_id+' '+str(index)+' '+chunk,flush=True)
+          print('POCKET_SCREENSHOT_END '+request_id,flush=True)
+          for name in ['run.json','launch.log','cleanup.json']:
+              print('POCKET_METADATA '+request_id+' '+name+' '+json.dumps((artifacts/name).read_text()[:16000]),flush=True)
+          PYSMOKE
+          python3 smoke.py
