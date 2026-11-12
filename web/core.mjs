@@ -119,6 +119,14 @@ export class GithubAPI {
     return response.status===204?null:response.json();
   }
   async check(){return this.request("GET","");}
+  async verifyAccess(){
+    const repository=await this.check();
+    if (String(repository?.full_name||"").toLowerCase()!==this.repo.toLowerCase())
+      throw Error("GitHub vrátil jiný repozitář.");
+    if (repository?.permissions?.push===false)
+      throw Error("Token má k repozitáři jen přístup pro čtení. Povol Contents: Read/Write.");
+    return repository;
+  }
   async snapshot(r,p){
     if (r.repo!==this.repo) throw Error("Repozitář nesouhlasí.");
     const result=await this.request("PUT","/contents/"+r.project_path,{
