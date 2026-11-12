@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pocket-ios-${{ github.ref }}
+  group: pocket-ios-${{ github.ref }}-${{ inputs.request_id }}
   cancel-in-progress: false
 
 jobs:
@@ -51,11 +51,11 @@ jobs:
           REQUEST_ID: ${{ inputs.request_id }}
           PROJECT_PATH: ${{ inputs.project_path }}
         run: |
-          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo 'source_sha must be a complete commit SHA.' >&2
             exit 1
           fi
-          if [[ ! "$REQUEST_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+          if [[ ! "$REQUEST_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
             echo 'request_id must be a UUID.' >&2
             exit 1
           fi
@@ -70,6 +70,32 @@ jobs:
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
 
+      - name: Verify checkout and record immutable build identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          PROJECT_PATH: ${{ inputs.project_path }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          payload = {
+              "schema": "xcode-pocket-build-identity/v1",
+              "request_id": os.environ["REQUEST_ID"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "project_path": os.environ["PROJECT_PATH"],
+              "workflow_run_id": int(os.environ["WORKFLOW_RUN_ID"]),
+              "workflow_attempt": int(os.environ["WORKFLOW_ATTEMPT"]),
+              "workflow": ".github/workflows/pocket-ios.yml",
+              "signed": False,
+          }
+          pathlib.Path("artifacts/build-identity.json").write_text(
+              json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
       - name: Record toolchain
         run: |
           mkdir -p artifacts
@@ -163,6 +189,7 @@ jobs:
           path: |
             artifacts/PocketApp-unsigned.app.zip
             artifacts/README.txt
+            artifacts/build-identity.json
           if-no-files-found: error
           retention-days: 7
 
@@ -175,6 +202,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Save bound build identity
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pocket-ios-identity-${{ inputs.request_id }}-${{ inputs.source_sha }}
+          path: artifacts/build-identity.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Summarize result
         if: always()
         env:

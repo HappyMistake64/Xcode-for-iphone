@@ -26,7 +26,7 @@ Ověřený stav k 12. 11. 2026
 
 • Workflow Pocket iOS build používá macos-26, timeout 15 minut a xcodebuild.
 • Běh 43123517253 skončil success. Dokládá kompilaci ukázkové aplikace, nikoli instalaci celého editoru.
-• Generátor verze 2 podporuje vnořené Swift soubory a vybrané UTF-8 soubory ve složce Resources/.
+• Generátor v5 podporuje schéma projektu v1–v3; v3 umí ověřené base64 obrázky a omezené image sety Assets.xcassets.
 • Výstupem workflow je PocketApp-unsigned.app.zip, nikoli podepsaná IPA.
 • Artefakty a dostupné logy jsou uchovávané 7 dní.
 • Automatický podpis, instalace na fyzický iPhone a celý cyklus aktualizace zatím nejsou ověřené.
@@ -38,7 +38,7 @@ Architektura
 3. Spustí workflow s UUID požadavku a přesným SHA commitu.
 4. Runner načte tento commit a generátor vytvoří PocketApp.xcodeproj.
 5. xcodebuild sestaví Release pro generic/platform=iOS s CODE_SIGNING_ALLOWED=NO.
-6. Workflow zveřejní nepodepsanou aplikaci a logy jako artefakty daného běhu.
+6. Workflow ověří checkout SHA a zveřejní nepodepsanou aplikaci, logy a identifikační manifest v artefaktech svázaných s request UUID i přesným SHA commitu.
 7. Balení IPA, podpis a instalace jsou následující plánovaná část.
 
 Kompilace probíhá v cloudu, ne přímo na procesoru iPhonu. Vyžaduje připojení a dostupný macOS runner.
@@ -61,12 +61,12 @@ Nepodepsaný ZIP nelze nainstalovat do iPhonu pouhým otevřením. Samotné pře
 
 Formát projektu a limity
 
-Generátor přijímá JSON s format: "xcode-pocket-project", version: 1 nebo 2 a mapou files obsahující relativní cesty a textové obsahy. Minimálně jeden soubor musí mít příponu .swift; spustitelný projekt potřebuje také vstupní bod, například SwiftUI @main.
+Generátor přijímá JSON s format: "xcode-pocket-project", version: 1, 2 nebo 3 a mapou files obsahující relativní cesty a textové obsahy. Schéma v3 může navíc obsahovat mapu binaries s MIME typem a base64 daty obrázků. Minimálně jeden soubor musí mít příponu .swift; spustitelný projekt potřebuje také vstupní bod, například SwiftUI @main.
 
 • Nejvýše 4 000 000 bajtů vstupního JSON a 1–200 textových souborů.
 • Relativní cesty, bez konfliktů soubor/složka a názvů lišících se pouze velikostí písmen.
 • Resources/: JSON, TXT, CSV, PLIST, XML, MD, HTML, CSS, JS.
-• Binární obrázky, asset katalogy a lokalizační balíčky zatím nejsou podporované.
+• Schéma v3 podporuje PNG/JPEG/GIF/WebP v Resources/ a omezené univerzální PNG/JPEG image sety v Resources/Assets.xcassets; obecné asset katalogy, app ikony a lokalizační balíčky podporované nejsou.
 • Webové soubory mimo Resources/ mohou být ve snímku, ale nejsou kompilované jako Swift.
 • Jeden generovaný target a scheme PocketApp; výchozí deployment target iOS 17.0.
 • Libovolné existující Xcode projekty, externí balíčky, rozšíření a více targetů nejsou implementovaným importním rozhraním.
@@ -84,6 +84,8 @@ Nahraďte REQUEST_UUID skutečným názvem existujícího snímku. Výstupní ad
 Známé problémy
 
 Nesprávné přiřazení stavu běhu
+
+Nově je v samostatné vývojové větvi připraven Build Manager, který ověřuje konkrétní workflow, request UUID, run ID a SHA-vázané artefakty. Specifikace: [Reliable Builds](docs/RELIABLE_BUILDS.md). Zdrojový kód webového editoru není v tomto repozitáři, takže integrace do jeho UI zůstává otevřená.
 
 V editoru byla zaznamenána zpráva „GitHub vrátil jiný běh než požadovanou kompilaci“, přestože kompilace na GitHubu uspěla. Příčina ani oprava nejsou potvrzené. Je třeba ověřit mapování request ID, workflow run ID, názvu běhu a commitu. Kontrola nesmí být odstraněna způsobem, který by zobrazoval cizí artefakt jako výsledek aktuálního požadavku.
 
