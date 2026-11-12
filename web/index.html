@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0a1020">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Xcode Pocket">
+  <meta name="description" content="SwiftUI editor a vzdálené sestavení nativních iOS aplikací přímo z iPhonu.">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css">
+  <title>Xcode Pocket | iPhone IDE</title>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="mark" aria-hidden="true">⌘</div>
+      <div>
+        <strong>Xcode Pocket</strong>
+        <span>Native iOS · Cloud build</span>
+      </div>
+    </div>
+    <div class="top-right"><span class="dot"></span> Created by David Volf</div>
+  </header>
+  <main class="layout">
+    <section class="hero">
+      <p class="eyebrow">IPHONE-FIRST DEVELOPMENT</p>
+      <h1>Swift aplikace.<br><em>Jen z telefonu.</em></h1>
+      <p>Uprav SwiftUI, ulož projekt na GitHub a sestav jej na macOS runneru. Žádný vlastní Mac není potřeba pro kompilaci. Instalace vyžaduje podepsání.</p>
+      <div class="hero-chips"><span>SwiftUI</span><span>GitHub Actions</span><span>Offline editace</span><span>Build identity</span></div>
+    </section>
+    <section class="panel connection">
+      <div class="panel-heading"><div><small>01 / CONNECTION</small><h2>Propojení GitHubu</h2></div><span id="connection" class="connection-badge" aria-live="polite">● Nepřipojeno</span></div>
+      <div class="form-grid">
+        <label>Repozitář <input id="repo" autocomplete="off" spellcheck="false" value="HappyMistake64/Xcode-for-iphone"></label>
+        <label>GitHub token <input id="connect-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="github_pat_…"></label>
+      </div>
+      <div class="inline-actions"><button type="button" id="check-access">Připojit</button><p class="small muted">Token se neukládá do souborů ani localStorage. Potřebuje <b>Contents: Read/Write</b> a <b>Actions: Read/Write</b>.</p></div>
+    </section>
+    <section class="panel workspace">
+      <div class="panel-heading"><div><small>02 / WORKSPACE</small><h2>Swift editor</h2></div><span class="hint">Lokální autosave</span></div>
+      <div class="form-grid">
+        <label>Název aplikace <input id="app-name" value="PocketApp" autocomplete="off"></label>
+        <label>Bundle ID <input id="bundle-id" value="cz.davidvolf.pocketapp" autocapitalize="off" spellcheck="false"></label>
+      </div>
+      <div class="editor-tools">
+        <label class="file-select">Soubor <select id="files" aria-label="Aktuální soubor"></select></label>
+        <button type="button" class="secondary mini" id="btn-add">+ Soubor</button>
+        <button type="button" class="secondary mini" id="btn-remove">Odstranit</button>
+      </div>
+      <div class="code-window">
+        <div class="code-title"><span><i class="indicator"></i><span id="filename">PocketApp.swift</span></span><small>Swift · UTF-8</small></div>
+        <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="Zdrojový kód Swift"></textarea>
+      </div>
+      <div class="inline-actions">
+        <button type="button" class="secondary" id="btn-import">Import JSON</button>
+        <button type="button" class="secondary" id="btn-export">Export JSON</button>
+        <input id="input-import" type="file" accept=".json,application/json" hidden>
+      </div>
+    </section>
+    <section class="panel build">
+      <div class="panel-heading"><div><small>03 / BUILD PIPELINE</small><h2>Vzdálená kompilace</h2></div><span class="hint">macOS · Xcode</span></div>
+      <p class="small muted">Každý build dostane vlastní UUID, přesný commit SHA a identifikační artefakt. Po obnovení stránky zůstává uložená historie požadavků.</p>
+      <div class="inline-actions">
+        <button type="button" id="btn-build" class="primary"><span aria-hidden="true">▶</span> Sestavit iOS aplikaci</button>
+        <button type="button" id="btn-refresh" class="secondary">↻ Obnovit běhy</button>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite">Připraveno.</div>
+      <div class="divider"></div>
+      <h3>Historie kompilací</h3>
+      <div id="builds" class="build-list"></div>
+    </section>
+    <section class="panel next">
+      <div class="panel-heading"><div><small>04 / DEVICE INSTALLATION</small><h2>Instalace na iPhone</h2></div><span class="tag">Podpis vyžadován</span></div>
+      <p>GitHub Actions vrátí <strong>nepodepsanou IPA</strong> a ZIP aplikace. Soubor IPA můžeš předat legitimní podpisové službě. Bez podpisu a provisioning profilu ji iOS nenainstaluje.</p>
+      <p class="small muted">Alternativou je Apple Developer Program, TestFlight nebo Xcode Personal Team (vyžaduje Xcode a obnovování podpisu). Přímá instalace bez těchto podmínek není podporována.</p>
+    </section>
+  </main>
+  <footer>Independent project · Not affiliated with Apple · <a href="https://github.com/HappyMistake64/Xcode-for-iphone" target="_blank" rel="noopener noreferrer">Source on GitHub</a></footer>
+  <script type="module" src="./app.mjs"></script>
+</body>
+</html>
