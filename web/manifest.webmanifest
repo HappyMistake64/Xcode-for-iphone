@@ -1,0 +1,1 @@
+{"name":"Xcode Pocket","short_name":"Pocket IDE","description":"SwiftUI development on iPhone via GitHub Actions.","start_url":"./index.html","scope":"./","display":"standalone","background_color":"#080e1a","theme_color":"#0a1020","icons":[{"src":"./icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}
