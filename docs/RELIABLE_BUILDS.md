@@ -35,7 +35,7 @@ The Python resolver validates run metadata and requires a SHA-bound **identity a
 
 ## Integrating the web editor
 
-The deployed web editor's source code is **not in this repository**. This change supplies the build workflow, resolver and integration contract, **not a claim that the deployed UI has already been fixed**.
+The new standalone mobile editor in web/ implements this request-persistence and GitHub API workflow. It is **not** the earlier externally deployed ChatGPT Sites editor; that original site's source is still not in this repository. GitHub Pages must be enabled and the new client tested on a real iPhone before claiming that the interactive browser workflow is complete.
 
 1. Persist request_id, source_sha, project_path and run_id (when known) as an immutable record **before dispatch**.
 2. After dispatch, look up only the exact Pocket iOS request title and workflow. If multiple runs share an ID, show ambiguity rather than guessing or selecting the newest.
