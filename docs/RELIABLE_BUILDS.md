@@ -10,11 +10,11 @@ The workflow maintains its existing display title **Pocket iOS <request_id>** fo
 
 It exports:
 
-- **pocket-ios-identity-<request_id>-<source_sha>**
-- **pocket-ios-app-<request_id>-<source_sha>** (on successful compilation)
-- **pocket-ios-logs-<request_id>-<source_sha>** (when logs are available)
+- **pocket-ios-identity-<request_id>-<source_sha>** (new immutable SHA binding)
+- **pocket-ios-app-<request_id>** (legacy-compatible name; only on successful compilation)
+- **pocket-ios-logs-<request_id>** (legacy-compatible name; when logs are available)
 
-The app artifact contains an **unsigned .app.zip** and an identity JSON. Neither is a signed installable IPA.
+The app artifact preserves the existing artifact name for compatibility with the deployed web editor. It contains an **unsigned .app.zip** and an identity JSON. Neither is a signed installable IPA.
 
 ## Resolve a build
 
@@ -31,7 +31,7 @@ Substitute the actual UUID/SHA. For private repositories provide a token in GH_T
 
 The JSON result includes **state, run_id, run_url, source_verified, artifacts, candidate_run_ids**. Only a **success** state with **source_verified: true** is allowed to show app downloads. States **not_found, queued, in_progress, ambiguous, identity_mismatch, artifact_missing** must never show results belonging to a different request. A **failed** run returns only matching logs, if available. Artifact download URLs are GitHub API URLs and may require authentication.
 
-The Python resolver validates run metadata and SHA-bound artifact names, **not the ZIP contents themselves**. Before trusting a downloaded artifact, inspect **build-identity.json** in that downloaded artifact ZIP and compare request_id, source_sha, and workflow_run_id with the saved request and selected run. This final check belongs in the web backend at download time.
+The Python resolver validates run metadata and requires a SHA-bound **identity artifact in the same run** before trusting legacy-named app artifacts; it does **not** validate ZIP contents itself. Before trusting a downloaded artifact, inspect **build-identity.json** in that downloaded artifact ZIP and compare request_id, source_sha, and workflow_run_id with the saved request and selected run. This final check belongs in the web backend at download time.
 
 ## Integrating the web editor
 
