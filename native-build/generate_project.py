@@ -3,10 +3,13 @@
 
 The generated target is always PocketApp. This generator does not compile or sign
 anything: run xcodebuild on macOS after it finishes. Nested .swift files and UTF-8 Resources/ files are supported.
+Schema v3 additionally supports validated base64 image Resources.
 Web files outside Resources/ may coexist but are not compiled.
 """
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -19,7 +22,7 @@ import xml.etree.ElementTree as ET
 
 MAX_BYTES = 4_000_000
 TARGET = "PocketApp"
-POCKET_GENERATOR_VERSION = 2
+POCKET_GENERATOR_VERSION = 4
 RESOURCE_SUFFIXES = {".json", ".txt", ".csv", ".plist", ".xml", ".md", ".html", ".css", ".js"}
 
 
@@ -36,47 +39,154 @@ def settings_block(settings):
     return "{ " + " ".join(f"{key} = {quoted(value)};" for key, value in settings.items()) + " }"
 
 
+def validate_binary(name, entry):
+    if not isinstance(entry, dict) or set(entry) != {"mime", "base64"}:
+        raise ValueError("Binary entries require exactly mime and base64.")
+    mime, encoded = entry["mime"], entry["base64"]
+    extensions = {"image/png": {".png"}, "image/jpeg": {".jpg", ".jpeg"},
+                  "image/gif": {".gif"}, "image/webp": {".webp"}}
+    if (not isinstance(mime, str) or mime not in extensions
+            or not name.startswith("Resources/")
+            or Path(name).suffix.lower() not in extensions[mime]):
+        raise ValueError("Binary image MIME, suffix and Resources/ destination must agree.")
+    if not isinstance(encoded, str) or not encoded or len(encoded) > ((MAX_BYTES + 2) // 3) * 4:
+        raise ValueError("Invalid or oversized base64 resource.")
+    try:
+        blob = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid base64 resource.") from exc
+    if base64.b64encode(blob).decode("ascii") != encoded:
+        raise ValueError("Resource base64 must be canonical without whitespace.")
+    signature = {
+        "image/png": len(blob) >= 24 and blob[:8] == b"\x89PNG\r\n\x1a\n" and blob[12:16] == b"IHDR",
+        "image/jpeg": len(blob) >= 4 and blob[:3] == b"\xff\xd8\xff" and blob[-2:] == b"\xff\xd9",
+        "image/gif": len(blob) >= 13 and blob[:6] in (b"GIF87a", b"GIF89a"),
+        "image/webp": len(blob) >= 16 and blob[:4] == b"RIFF" and blob[8:12] == b"WEBP",
+    }
+    if not signature[mime]:
+        raise ValueError("Image bytes do not match the declared format or header is truncated.")
+    return blob
+
+
+CATALOG = "Resources/Assets.xcassets"
+
+
+def validate_catalog(files, binaries):
+    """Bounded universal PNG/JPEG image sets, not arbitrary asset catalogs."""
+    all_paths = set(files) | set(binaries)
+    asset_paths = {p for p in all_paths if any(part.lower().endswith(".xcassets") for part in p.split("/"))}
+    if not asset_paths:
+        return set()
+    if any(not p.startswith(CATALOG + "/") for p in asset_paths):
+        raise ValueError("Only Resources/Assets.xcassets is supported.")
+
+    def document(path):
+        if path not in files:
+            raise ValueError("Asset catalog Contents.json is missing: " + path)
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate asset JSON key.")
+                result[key] = value
+            return result
+        value = json.loads(files[path], object_pairs_hook=unique)
+        if not isinstance(value, dict):
+            raise ValueError("Asset Contents.json must be an object.")
+        info = value.get("info")
+        if (not isinstance(info, dict) or set(info) - {"version", "author"}
+                or type(info.get("version")) is not int or info["version"] != 1
+                or ("author" in info and not isinstance(info["author"], str))):
+            raise ValueError("Asset Contents.json requires info.version 1.")
+        return value
+
+    root = CATALOG + "/Contents.json"
+    if set(document(root)) != {"info"}:
+        raise ValueError("Unsupported catalog root metadata.")
+    accepted, sets = {root}, set()
+    for path in asset_paths - {root}:
+        relative = path[len(CATALOG) + 1:].split("/")
+        if (len(relative) != 2 or not relative[0].endswith(".imageset")
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,79}", relative[0][:-9])):
+            raise ValueError("Only named universal image sets are supported; no app icons, colors or nested asset groups.")
+        sets.add(relative[0])
+    for name in sorted(sets):
+        folder = CATALOG + "/" + name + "/"
+        metadata = folder + "Contents.json"
+        value = document(metadata)
+        if set(value) != {"info", "images"} or not isinstance(value["images"], list) or not 1 <= len(value["images"]) <= 3:
+            raise ValueError("Image sets require 1–3 universal scaled image entries.")
+        accepted.add(metadata)
+        scales, used = set(), set()
+        for entry in value["images"]:
+            if (not isinstance(entry, dict) or set(entry) != {"idiom", "scale", "filename"}
+                    or entry["idiom"] != "universal" or entry["scale"] not in ("1x", "2x", "3x")
+                    or not isinstance(entry["filename"], str)
+                    or "/" in entry["filename"] or "\\" in entry["filename"]
+                    or entry["filename"] in ("", ".", "..")):
+                raise ValueError("Unsupported asset image entry or unsafe image reference.")
+            path = folder + entry["filename"]
+            if entry["scale"] in scales or path in used:
+                raise ValueError("Duplicate image scale or reference.")
+            if path not in binaries or binaries[path]["mime"] not in ("image/png", "image/jpeg"):
+                raise ValueError("Image sets must reference existing PNG/JPEG binary resources.")
+            scales.add(entry["scale"])
+            used.add(path)
+            accepted.add(path)
+    if asset_paths != accepted:
+        raise ValueError("Asset catalog contains unreferenced or unsupported files.")
+    return accepted
+
+
 def read_input(path):
+    # Base64 overhead counts toward the same serialized browser/export limit.
+    if path.stat().st_size > MAX_BYTES:
+        raise ValueError("Project JSON exceeds 4 MB encoded limit.")
     raw = path.read_bytes()
-    if len(raw) > MAX_BYTES:
-        raise ValueError("Project JSON exceeds 4 MB.")
     data = json.loads(raw)
     if not isinstance(data, dict) or data.get("format") != "xcode-pocket-project":
         raise ValueError("Expected an xcode-pocket-project JSON export.")
-    files = data.get("files")
-    if not isinstance(files, dict) or not 1 <= len(files) <= 200:
-        raise ValueError("Project must contain 1–200 text files.")
-    if data.get("version") not in (1, 2):
+    if data.get("version") not in (1, 2, 3):
         raise ValueError("Unsupported project schema.")
-    paths = set()
-    for name, content in files.items():
+    files, binaries = data.get("files"), data.get("binaries", {})
+    if not isinstance(files, dict) or not isinstance(binaries, dict) or not 1 <= len(files) + len(binaries) <= 200:
+        raise ValueError("Project must contain 1–200 total files.")
+    if data["version"] != 3 and "binaries" in data:
+        raise ValueError("Binary resources require schema v3.")
+    paths, total = set(), 0
+    for name, content in list(files.items()) + list(binaries.items()):
         if (not isinstance(name, str) or not name or len(name) > 240
                 or unicodedata.normalize("NFC", name) != name
                 or re.search(r"[\\\x00-\x1f\x7f]", name)
-                or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in name.split("/"))
-                or not isinstance(content, str)):
-            raise ValueError("Invalid relative text file path or content.")
+                or any(not part or part != part.strip() or part in (".", "..", "__proto__", "constructor", "prototype") for part in name.split("/"))):
+            raise ValueError("Invalid relative file path.")
         if name.casefold() in paths:
-            raise ValueError("Paths differ only by letter case.")
+            raise ValueError("Duplicate paths or paths differ only by letter case.")
         paths.add(name.casefold())
-        if name.startswith("Resources/") and Path(name).suffix.lower() not in RESOURCE_SUFFIXES:
-            raise ValueError("Resources supports UTF-8 text data only; binary/assets/localization not supported yet.")
-        if name.startswith("Resources/") and "\x00" in content:
-            raise ValueError("Binary resource content is not supported.")
+        if name in files:
+            if not isinstance(content, str):
+                raise ValueError("Text file content must be a string.")
+            if name.startswith("Resources/") and Path(name).suffix.lower() not in RESOURCE_SUFFIXES:
+                raise ValueError("Text Resources supports UTF-8 data; images belong in the v3 binaries map.")
+            if name.startswith("Resources/") and "\x00" in content:
+                raise ValueError("Binary resource content is not supported as text.")
+            total += len(content.encode("utf-8"))
+        else:
+            total += len(validate_binary(name, content))
+        if total > MAX_BYTES:
+            raise ValueError("Decoded project content exceeds 4 MB.")
     for name in paths:
         parts = name.split("/")
         if any("/".join(parts[:i]) in paths for i in range(1, len(parts))):
             raise ValueError("File/folder path conflict.")
+    validate_catalog(files, binaries)
     swift = {name: content for name, content in files.items() if name.endswith(".swift")}
     if not swift:
         raise ValueError("No .swift files found. Native compilation needs Swift source, including an @main app.")
-    # macOS commonly uses case-insensitive file systems.
-    if len({name.casefold() for name in swift}) != len(swift):
-        raise ValueError("Swift filenames differ only by letter case.")
     return data, swift
 
 
-def build_project(swift, bundle_id, deployment_target, resources=None):
+def build_project(swift, bundle_id, deployment_target, resources=None, catalog=False):
     resources = resources or {}
     ids = {key: uid(key) for key in (
         "project", "main", "sources-group", "products", "product", "target",
@@ -104,13 +214,19 @@ def build_project(swift, bundle_id, deployment_target, resources=None):
         obj(bid, f"isa = PBXBuildFile; fileRef = {rid};")
         resource_ids.append(bid)
 
+    if catalog:
+        rid, bid = uid("asset-catalog"), uid("asset-catalog-build")
+        obj(rid, 'isa = PBXFileReference; lastKnownFileType = wrapper.assetcatalog; path = Assets.xcassets; sourceTree = "<group>";')
+        obj(bid, f"isa = PBXBuildFile; fileRef = {rid};")
+        resource_ids.append(bid)
+
     def array(values):
         return "(" + ", ".join(values) + ("," if values else "") + ")"
 
     obj(ids["product"], f"isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = {TARGET}.app; sourceTree = BUILT_PRODUCTS_DIR;")
     obj(ids["sources-group"], f"isa = PBXGroup; children = {array(file_ids)}; path = Sources; sourceTree = {quoted('<group>')};")
     obj(ids["products"], f"isa = PBXGroup; children = ({ids['product']},); name = Products; sourceTree = {quoted('<group>')};")
-    main_children = [ids["sources-group"], ids["products"]] + ([uid("resources-folder")] if resources else [])
+    main_children = [ids["sources-group"], ids["products"]] + ([uid("resources-folder")] if resources else []) + ([uid("asset-catalog")] if catalog else [])
     obj(ids["main"], f"isa = PBXGroup; children = {array(main_children)}; sourceTree = {quoted('<group>')};")
     for phase, isa, members in (("sources-phase", "PBXSourcesBuildPhase", build_ids), ("frameworks-phase", "PBXFrameworksBuildPhase", []), ("resources-phase", "PBXResourcesBuildPhase", resource_ids)):
         obj(ids[phase], f"isa = {isa}; buildActionMask = 2147483647; files = {array(members)}; runOnlyForDeploymentPostprocessing = 0;")
@@ -169,6 +285,9 @@ def write_scheme(path, target_id):
 def generate(input_path, output, bundle_id, app_name, deployment_target):
     data, swift = read_input(input_path)
     resources = {name: content for name, content in data["files"].items() if name.startswith("Resources/")}
+    binaries = {name: validate_binary(name, entry) for name, entry in data.get("binaries", {}).items()}
+    catalog_paths = validate_catalog(data["files"], data.get("binaries", {}))
+    raw_resources = {name: content for name, content in {**resources, **binaries}.items() if name not in catalog_paths}
     if not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", bundle_id):
         raise ValueError("Bundle ID must use dot-separated letters, numbers or hyphens.")
     if not app_name.strip() or len(app_name) > 80 or any(ord(c) < 32 for c in app_name):
@@ -177,7 +296,7 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
         raise ValueError("Deployment target must be an iOS version from 17.0 to 29.x.")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("Output directory must be empty or absent.")
-    project, target_id = build_project(swift, bundle_id, deployment_target, resources)
+    project, target_id = build_project(swift, bundle_id, deployment_target, raw_resources, bool(catalog_paths))
     sources = output / "Sources"
     scheme_dir = output / (TARGET + ".xcodeproj") / "xcshareddata" / "xcschemes"
     sources.mkdir(parents=True, exist_ok=True)
@@ -187,9 +306,13 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(content, encoding="utf-8")
     for name, content in resources.items():
-        destination = output / name
+        destination = output / (name[len("Resources/"):] if name in catalog_paths else name)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(content, encoding="utf-8")
+    for name, content in binaries.items():
+        destination = output / (name[len("Resources/"):] if name in catalog_paths else name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
     (output / (TARGET + ".xcodeproj") / "project.pbxproj").write_text(project, encoding="utf-8")
     write_scheme(scheme_dir / (TARGET + ".xcscheme"), target_id)
     info = {
@@ -203,7 +326,7 @@ def generate(input_path, output, bundle_id, app_name, deployment_target):
     }
     with (output / "Info.plist").open("wb") as stream:
         plistlib.dump(info, stream)
-    return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "bundle_id": bundle_id, "signed": False, "generator_version": POCKET_GENERATOR_VERSION, "resource_files": len(resources)}
+    return {"project": str(output / (TARGET + ".xcodeproj")), "scheme": TARGET, "swift_files": len(swift), "bundle_id": bundle_id, "signed": False, "generator_version": POCKET_GENERATOR_VERSION, "resource_files": len(resources) + len(binaries), "binary_resource_files": len(binaries), "asset_catalogs": int(bool(catalog_paths))}
 
 
 def main():
